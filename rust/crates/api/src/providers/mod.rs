@@ -173,7 +173,10 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
     // route to the correct provider regardless of which auth env vars are set.
     // Without this, detect_provider_kind falls through to the auth-sniffer
     // order and misroutes to Anthropic if ANTHROPIC_API_KEY is present.
-    if canonical.starts_with("openai/") || canonical.starts_with("gpt-") {
+    if canonical.starts_with("openai/")
+        || canonical.starts_with("groq/")
+        || canonical.starts_with("gpt-")
+    {
         return Some(ProviderMetadata {
             provider: ProviderKind::OpenAi,
             auth_env: "OPENAI_API_KEY",
@@ -238,6 +241,18 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
         }),
         "grok-3" | "grok-3-mini" => Some(ModelTokenLimit {
             max_output_tokens: 64_000,
+            context_window_tokens: 131_072,
+        }),
+        "openai/gpt-oss-120b" | "openai/gpt-oss-20b" => Some(ModelTokenLimit {
+            max_output_tokens: 4_096,
+            context_window_tokens: 131_072,
+        }),
+        "llama-3.3-70b-versatile" => Some(ModelTokenLimit {
+            max_output_tokens: 4_096,
+            context_window_tokens: 131_072,
+        }),
+        "groq/compound" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
             context_window_tokens: 131_072,
         }),
         _ => None,
@@ -387,9 +402,24 @@ mod tests {
     }
 
     #[test]
+    fn groq_namespaced_model_routes_to_openai_compat_not_anthropic() {
+        let kind = super::metadata_for_model("groq/compound")
+            .map(|m| m.provider)
+            .unwrap_or_else(|| detect_provider_kind("groq/compound"));
+        assert_eq!(
+            kind,
+            ProviderKind::OpenAi,
+            "groq/ prefix must route to the OpenAI-compatible provider"
+        );
+    }
+
+    #[test]
     fn keeps_existing_max_token_heuristic() {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
+        assert_eq!(max_tokens_for_model("openai/gpt-oss-120b"), 4_096);
+        assert_eq!(max_tokens_for_model("llama-3.3-70b-versatile"), 4_096);
+        assert_eq!(max_tokens_for_model("groq/compound"), 8_192);
     }
 
     #[test]
@@ -453,6 +483,24 @@ mod tests {
         assert_eq!(
             model_token_limit("grok-mini")
                 .expect("grok-mini should resolve to a registered model")
+                .context_window_tokens,
+            131_072
+        );
+        assert_eq!(
+            model_token_limit("groq/compound")
+                .expect("groq/compound should be registered")
+                .max_output_tokens,
+            8_192
+        );
+        assert_eq!(
+            model_token_limit("openai/gpt-oss-120b")
+                .expect("openai/gpt-oss-120b should be registered")
+                .max_output_tokens,
+            4_096
+        );
+        assert_eq!(
+            model_token_limit("llama-3.3-70b-versatile")
+                .expect("llama-3.3-70b-versatile should be registered")
                 .context_window_tokens,
             131_072
         );

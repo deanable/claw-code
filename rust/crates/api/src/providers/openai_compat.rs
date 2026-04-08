@@ -206,11 +206,16 @@ impl OpenAiCompatClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = chat_completions_endpoint(&self.base_url);
+        let payload = build_chat_completion_request(request, self.config());
+        let _ = std::fs::write(
+            std::env::temp_dir().join("claw-openai-compat-last-request.json"),
+            serde_json::to_vec_pretty(&payload).unwrap_or_default(),
+        );
         self.http
             .post(&request_url)
             .header("content-type", "application/json")
             .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request, self.config()))
+            .json(&payload)
             .send()
             .await
             .map_err(ApiError::from)
@@ -764,12 +769,11 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                 InputContentBlock::ToolResult {
                     tool_use_id,
                     content,
-                    is_error,
+                    is_error: _,
                 } => Some(json!({
                     "role": "tool",
                     "tool_call_id": tool_use_id,
                     "content": flatten_tool_result_content(content),
-                    "is_error": is_error,
                 })),
                 InputContentBlock::ToolUse { .. } => None,
             })

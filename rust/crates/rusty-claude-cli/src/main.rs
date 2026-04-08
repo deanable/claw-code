@@ -26,8 +26,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use api::{
     detect_provider_kind, oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient,
     AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
-    MessageResponse, OutputContentBlock, PromptCache, ProviderKind, StreamEvent as ApiStreamEvent,
-    ToolChoice, ToolDefinition, ToolResultContentBlock,
+    MessageResponse, OutputContentBlock, PromptCache, ProviderClient, ProviderKind,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -58,10 +58,16 @@ use tools::{execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinit
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
-    if model.contains("opus") {
-        32_000
-    } else {
-        64_000
+    let plugin_override = env::current_dir()
+        .ok()
+        .and_then(|cwd| ConfigLoader::default_for(&cwd).load().ok())
+        .and_then(|config| config.plugins().max_output_tokens());
+    match model {
+        "openai/gpt-oss-120b" | "openai/gpt-oss-20b" | "llama-3.3-70b-versatile" => {
+            plugin_override.unwrap_or(4_096)
+        }
+        "groq/compound" => plugin_override.unwrap_or(8_192),
+        _ => api::max_tokens_for_model_with_override(model, plugin_override),
     }
 }
 const DEFAULT_DATE: &str = "2026-03-31";
@@ -6296,7 +6302,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: AnthropicClient,
+    client: ProviderClient,
     session_id: String,
     model: String,
     enable_tools: bool,
@@ -6316,10 +6322,15 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let provider = detect_provider_kind(&model);
+        let anthropic_auth = if matches!(provider, ProviderKind::Anthropic) {
+            Some(resolve_cli_auth_source()?)
+        } else {
+            None
+        };
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url())
+            client: ProviderClient::from_model_with_anthropic_auth(&model, anthropic_auth)?
                 .with_prompt_cache(PromptCache::new(session_id)),
             session_id: session_id.to_string(),
             model,
@@ -7345,7 +7356,7 @@ fn response_to_events(
     Ok(events)
 }
 
-fn push_prompt_cache_record(client: &AnthropicClient, events: &mut Vec<AssistantEvent>) {
+fn push_prompt_cache_record(client: &ProviderClient, events: &mut Vec<AssistantEvent>) {
     if let Some(record) = client.take_last_prompt_cache_record() {
         if let Some(event) = prompt_cache_record_to_runtime_event(record) {
             events.push(AssistantEvent::PromptCache(event));
