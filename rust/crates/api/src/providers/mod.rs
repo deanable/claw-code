@@ -184,6 +184,19 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
         });
     }
+    // Alibaba DashScope compatible-mode endpoint. Routes qwen/* and bare
+    // qwen-* model names (qwen-max, qwen-plus, qwen-turbo, qwen-qwq, etc.)
+    // to the OpenAI-compat client pointed at DashScope's /compatible-mode/v1.
+    // Uses the OpenAi provider kind because DashScope speaks the OpenAI REST
+    // shape — only the base URL and auth env var differ.
+    if canonical.starts_with("qwen/") || canonical.starts_with("qwen-") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "DASHSCOPE_API_KEY",
+            base_url_env: "DASHSCOPE_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
+        });
+    }
     None
 }
 
@@ -402,6 +415,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn groq_namespaced_model_routes_to_openai_compat_not_anthropic() {
         let kind = super::metadata_for_model("groq/compound")
             .map(|m| m.provider)
@@ -410,6 +424,34 @@ mod tests {
             kind,
             ProviderKind::OpenAi,
             "groq/ prefix must route to the OpenAI-compatible provider"
+=======
+    fn qwen_prefix_routes_to_dashscope_not_anthropic() {
+        // User request from Discord #clawcode-get-help: web3g wants to use
+        // Qwen 3.6 Plus via native Alibaba DashScope API (not OpenRouter,
+        // which has lower rate limits). metadata_for_model must route
+        // qwen/* and bare qwen-* to the OpenAi provider kind pointed at
+        // the DashScope compatible-mode endpoint, regardless of whether
+        // ANTHROPIC_API_KEY is present in the environment.
+        let meta = super::metadata_for_model("qwen/qwen-max")
+            .expect("qwen/ prefix must resolve to DashScope metadata");
+        assert_eq!(meta.provider, ProviderKind::OpenAi);
+        assert_eq!(meta.auth_env, "DASHSCOPE_API_KEY");
+        assert_eq!(meta.base_url_env, "DASHSCOPE_BASE_URL");
+        assert!(meta.default_base_url.contains("dashscope.aliyuncs.com"));
+
+        // Bare qwen- prefix also routes
+        let meta2 = super::metadata_for_model("qwen-plus")
+            .expect("qwen- prefix must resolve to DashScope metadata");
+        assert_eq!(meta2.provider, ProviderKind::OpenAi);
+        assert_eq!(meta2.auth_env, "DASHSCOPE_API_KEY");
+
+        // detect_provider_kind must agree even if ANTHROPIC_API_KEY is set
+        let kind = detect_provider_kind("qwen/qwen3-coder");
+        assert_eq!(
+            kind,
+            ProviderKind::OpenAi,
+            "qwen/ prefix must win over auth-sniffer order"
+>>>>>>> eed57212bbe9d78a3c07a3ceb3f37fc426c1f1f9
         );
     }
 
@@ -528,6 +570,7 @@ mod tests {
             }]),
             tool_choice: Some(ToolChoice::Auto),
             stream: true,
+            ..Default::default()
         };
 
         let error = preflight_message_request(&request)
@@ -566,6 +609,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream: false,
+            ..Default::default()
         };
 
         preflight_message_request(&request)

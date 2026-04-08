@@ -54,7 +54,9 @@ use runtime::{
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use tools::{execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
+use tools::{
+    execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
+};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
@@ -211,8 +213,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             run_stale_base_preflight(base_commit.as_deref());
             let stdin_context = read_piped_stdin();
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-            LiveCli::new(model, true, allowed_tools, permission_mode)?
-                .run_turn_with_output(&effective_prompt, output_format, false)?;
+            LiveCli::new(model, true, allowed_tools, permission_mode)?.run_turn_with_output(
+                &effective_prompt,
+                output_format,
+                false,
+            )?;
         }
         CliAction::Login { output_format } => run_login(output_format)?,
         CliAction::Logout { output_format } => run_logout(output_format)?,
@@ -948,11 +953,7 @@ fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
 fn config_model_for_current_dir() -> Option<String> {
     let cwd = env::current_dir().ok()?;
     let loader = ConfigLoader::default_for(&cwd);
-    loader
-        .load()
-        .ok()?
-        .model()
-        .map(ToOwned::to_owned)
+    loader.load().ok()?.model().map(ToOwned::to_owned)
 }
 
 fn resolve_repl_model(cli_model: String) -> String {
@@ -1027,10 +1028,7 @@ fn parse_system_prompt_args(
     })
 }
 
-fn parse_export_args(
-    args: &[String],
-    output_format: CliOutputFormat,
-) -> Result<CliAction, String> {
+fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
     let mut session_reference = LATEST_SESSION_REFERENCE.to_string();
     let mut output_path: Option<PathBuf> = None;
     let mut index = 0;
@@ -1342,8 +1340,13 @@ fn run_worker_state(output_format: CliOutputFormat) -> Result<(), Box<dyn std::e
     let state_path = cwd.join(".claw").join("worker-state.json");
     if !state_path.exists() {
         match output_format {
-            CliOutputFormat::Text => println!("No worker state file found at {}", state_path.display()),
-            CliOutputFormat::Json => println!("{}", serde_json::json!({"error": "no_state_file", "path": state_path.display().to_string()})),
+            CliOutputFormat::Text => {
+                println!("No worker state file found at {}", state_path.display())
+            }
+            CliOutputFormat::Json => println!(
+                "{}",
+                serde_json::json!({"error": "no_state_file", "path": state_path.display().to_string()})
+            ),
         }
         return Ok(());
     }
@@ -2666,7 +2669,8 @@ fn run_resume_command(
             json: None,
         }),
         SlashCommand::History { count } => {
-            let limit = parse_history_count(count.as_deref()).map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+            let limit = parse_history_count(count.as_deref())
+                .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
             let entries = collect_session_prompt_history(session);
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
@@ -5337,16 +5341,18 @@ fn format_history_timestamp(timestamp_ms: u64) -> String {
     let seconds = seconds_of_day % 60;
 
     let (year, month, day) = civil_from_days(i64::try_from(days_since_epoch).unwrap_or(0));
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{subsec_ms:03}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{subsec_ms:03}Z")
 }
 
 // Computes civil (Gregorian) year/month/day from days since the Unix epoch
 // (1970-01-01) using Howard Hinnant's `civil_from_days` algorithm.
 fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let z = days + 719_468;
-    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
     let doe = (z - era * 146_097) as u64; // [0, 146_096]
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
     let y = yoe as i64 + era * 400;
@@ -6386,6 +6392,7 @@ impl ApiClient for AnthropicRuntimeClient {
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
+            ..Default::default()
         };
 
         self.runtime.block_on(async {
@@ -6401,7 +6408,10 @@ impl ApiClient for AnthropicRuntimeClient {
                     .await;
                 match result {
                     Ok(events) => return Ok(events),
-                    Err(error) if error.to_string().contains("post-tool stall") && attempt < max_attempts => {
+                    Err(error)
+                        if error.to_string().contains("post-tool stall")
+                            && attempt < max_attempts =>
+                    {
                         // Stalled after tool completion — nudge the model by
                         // re-sending the same request.
                         continue;
@@ -6410,9 +6420,7 @@ impl ApiClient for AnthropicRuntimeClient {
                 }
             }
 
-            Err(RuntimeError::new(
-                "post-tool continuation nudge exhausted",
-            ))
+            Err(RuntimeError::new("post-tool continuation nudge exhausted"))
         })
     }
 }
@@ -6426,13 +6434,13 @@ impl AnthropicRuntimeClient {
         message_request: &MessageRequest,
         apply_stall_timeout: bool,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let mut stream =
-            self.client
-                .stream_message(message_request)
-                .await
-                .map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                })?;
+        let mut stream = self
+            .client
+            .stream_message(message_request)
+            .await
+            .map_err(|error| {
+                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+            })?;
         let mut stdout = io::stdout();
         let mut sink = io::sink();
         let out: &mut dyn Write = if self.emit_output {
@@ -6452,10 +6460,7 @@ impl AnthropicRuntimeClient {
             let next = if apply_stall_timeout && !received_any_event {
                 match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
                     Ok(inner) => inner.map_err(|error| {
-                        RuntimeError::new(format_user_visible_api_error(
-                            &self.session_id,
-                            &error,
-                        ))
+                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
                     })?,
                     Err(_elapsed) => {
                         return Err(RuntimeError::new(
@@ -6639,9 +6644,15 @@ fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) 
             context_window_tokens,
         } => {
             lines.push(format!("  Model            {model}"));
-            lines.push(format!("  Input estimate   ~{estimated_input_tokens} tokens (heuristic)"));
-            lines.push(format!("  Requested output {requested_output_tokens} tokens"));
-            lines.push(format!("  Total estimate   ~{estimated_total_tokens} tokens (heuristic)"));
+            lines.push(format!(
+                "  Input estimate   ~{estimated_input_tokens} tokens (heuristic)"
+            ));
+            lines.push(format!(
+                "  Requested output {requested_output_tokens} tokens"
+            ));
+            lines.push(format!(
+                "  Total estimate   ~{estimated_total_tokens} tokens (heuristic)"
+            ));
             lines.push(format!("  Context window   {context_window_tokens} tokens"));
         }
         api::ApiError::Api { message, body, .. } => {
@@ -7614,7 +7625,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw login")?;
     writeln!(out, "  claw logout")?;
     writeln!(out, "  claw init")?;
-    writeln!(out, "  claw export [PATH] [--session SESSION] [--output PATH]")?;
+    writeln!(
+        out,
+        "  claw export [PATH] [--session SESSION] [--output PATH]"
+    )?;
     writeln!(
         out,
         "      Dump the latest (or named) session as markdown; writes to PATH or stdout"
@@ -7679,10 +7693,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  claw --output-format json prompt \"explain src/main.rs\""
     )?;
-    writeln!(
-        out,
-        "  claw --compact \"summarize Cargo.toml\" | wc -l"
-    )?;
+    writeln!(out, "  claw --compact \"summarize Cargo.toml\" | wc -l")?;
     writeln!(
         out,
         "  claw --allowedTools read,glob \"summarize Cargo.toml\""
@@ -7733,18 +7744,19 @@ mod tests {
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
         format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_git_status_branch,
-        parse_git_status_metadata_for, parse_git_workspace_summary, permission_policy,
-        print_help_to, push_output_block, render_config_report, render_diff_report,
-        render_diff_report_for, render_memory_report, render_repl_help, render_resume_usage,
-        resolve_model_alias, resolve_model_alias_with_config, resolve_repl_model,
-        resolve_session_reference, response_to_events, resume_supported_slash_commands,
-        run_resume_command, slash_command_completion_candidates_with_sessions, status_context,
-        validate_no_args, write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor,
-        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
-        LocalHelpTopic, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
-        PromptHistoryEntry, render_prompt_history_report, parse_history_count,
-        parse_export_args, render_session_markdown, summarize_tool_payload_for_markdown, short_tool_id,
+        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
+        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
+        parse_history_count, permission_policy, print_help_to, push_output_block,
+        render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
+        render_prompt_history_report, render_repl_help, render_resume_usage,
+        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
+        resolve_repl_model, resolve_session_reference, response_to_events,
+        resume_supported_slash_commands, run_resume_command, short_tool_id,
+        slash_command_completion_candidates_with_sessions, status_context,
+        summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture, CliAction,
+        CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
+        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry, SlashCommand,
+        StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -8596,8 +8608,12 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_args(&["state".to_string(), "--output-format".to_string(), "json".to_string()])
-                .expect("state --output-format json should parse"),
+            parse_args(&[
+                "state".to_string(),
+                "--output-format".to_string(),
+                "json".to_string()
+            ])
+            .expect("state --output-format json should parse"),
             CliAction::State {
                 output_format: CliOutputFormat::Json,
             }
@@ -9427,8 +9443,7 @@ mod tests {
         std::env::remove_var("ANTHROPIC_MODEL");
         std::env::set_var("ANTHROPIC_MODEL", "sonnet");
 
-        let resolved =
-            with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
+        let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
 
         assert_eq!(resolved, "claude-sonnet-4-6");
 
@@ -9447,8 +9462,7 @@ mod tests {
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_MODEL");
 
-        let resolved =
-            with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
+        let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
 
         assert_eq!(resolved, DEFAULT_MODEL);
 
@@ -10813,6 +10827,9 @@ UU conflicted.rs",
 
     #[test]
     fn build_runtime_runs_plugin_lifecycle_init_and_shutdown() {
+        // Serialize access to process-wide env vars so parallel tests that
+        // set/remove ANTHROPIC_API_KEY do not race with this test.
+        let _guard = env_lock();
         let config_home = temp_dir();
         // Inject a dummy API key so runtime construction succeeds without real credentials.
         // This test only exercises plugin lifecycle (init/shutdown), never calls the API.
