@@ -26,16 +26,17 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use api::{
     detect_provider_kind, oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient,
     AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
-    MessageResponse, OutputContentBlock, PromptCache, ProviderClient, ProviderKind,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
+    ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 
 use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
     handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
     handle_skills_slash_command, handle_skills_slash_command_json, render_slash_command_help,
-    resume_supported_slash_commands, slash_command_specs, validate_slash_command_input,
-    SkillSlashDispatch, SlashCommand,
+    render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
+    slash_command_specs, validate_slash_command_input, SkillSlashDispatch, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -72,7 +73,12 @@ fn max_tokens_for_model(model: &str) -> u32 {
         _ => api::max_tokens_for_model_with_override(model, plugin_override),
     }
 }
-const DEFAULT_DATE: &str = "2026-03-31";
+// Build-time constants injected by build.rs (fall back to static values when
+// build.rs hasn't run, e.g. in doc-test or unusual toolchain environments).
+const DEFAULT_DATE: &str = match option_env!("BUILD_DATE") {
+    Some(d) => d,
+    None => "unknown",
+};
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
@@ -110,7 +116,22 @@ type RuntimePluginStateBuildOutput = (
 fn main() {
     if let Err(error) = run() {
         let message = error.to_string();
-        if message.contains("`claw --help`") {
+        // When --output-format json is active, emit errors as JSON so downstream
+        // tools can parse failures the same way they parse successes (ROADMAP #42).
+        let argv: Vec<String> = std::env::args().collect();
+        let json_output = argv
+            .windows(2)
+            .any(|w| w[0] == "--output-format" && w[1] == "json")
+            || argv.iter().any(|a| a == "--output-format=json");
+        if json_output {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "type": "error",
+                    "error": message,
+                })
+            );
+        } else if message.contains("`claw --help`") {
             eprintln!("error: {message}");
         } else {
             eprintln!(
@@ -207,17 +228,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             allowed_tools,
             permission_mode,
-            compact: _,
+            compact,
             base_commit,
+            reasoning_effort,
+            allow_broad_cwd,
         } => {
+            enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
             run_stale_base_preflight(base_commit.as_deref());
-            let stdin_context = read_piped_stdin();
+            // Only consume piped stdin as prompt context when the permission
+            // mode is fully unattended. In modes where the permission
+            // prompter may invoke CliPermissionPrompter::decide(), stdin
+            // must remain available for interactive approval; otherwise the
+            // prompter's read_line() would hit EOF and deny every request.
+            let stdin_context = if matches!(permission_mode, PermissionMode::DangerFullAccess) {
+                read_piped_stdin()
+            } else {
+                None
+            };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-            LiveCli::new(model, true, allowed_tools, permission_mode)?.run_turn_with_output(
-                &effective_prompt,
-                output_format,
-                false,
-            )?;
+            let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+            cli.set_reasoning_effort(reasoning_effort);
+            cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
         CliAction::Login { output_format } => run_login(output_format)?,
         CliAction::Logout { output_format } => run_logout(output_format)?,
@@ -234,7 +265,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             allowed_tools,
             permission_mode,
             base_commit,
-        } => run_repl(model, allowed_tools, permission_mode, base_commit)?,
+            reasoning_effort,
+            allow_broad_cwd,
+        } => run_repl(
+            model,
+            allowed_tools,
+            permission_mode,
+            base_commit,
+            reasoning_effort,
+            allow_broad_cwd,
+        )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
@@ -295,6 +335,8 @@ enum CliAction {
         permission_mode: PermissionMode,
         compact: bool,
         base_commit: Option<String>,
+        reasoning_effort: Option<String>,
+        allow_broad_cwd: bool,
     },
     Login {
         output_format: CliOutputFormat,
@@ -321,6 +363,8 @@ enum CliAction {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
         base_commit: Option<String>,
+        reasoning_effort: Option<String>,
+        allow_broad_cwd: bool,
     },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
@@ -364,12 +408,39 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut allowed_tool_values = Vec::new();
     let mut compact = false;
     let mut base_commit: Option<String> = None;
-    let mut rest = Vec::new();
+    let mut reasoning_effort: Option<String> = None;
+    let mut allow_broad_cwd = false;
+    let mut rest: Vec<String> = Vec::new();
     let mut index = 0;
 
     while index < args.len() {
         match args[index].as_str() {
             "--help" | "-h" if rest.is_empty() => {
+                wants_help = true;
+                index += 1;
+            }
+            "--help" | "-h"
+                if !rest.is_empty()
+                    && matches!(
+                        rest[0].as_str(),
+                        "prompt"
+                            | "login"
+                            | "logout"
+                            | "version"
+                            | "state"
+                            | "init"
+                            | "export"
+                            | "commit"
+                            | "pr"
+                            | "issue"
+                    ) =>
+            {
+                // `--help` following a subcommand that would otherwise forward
+                // the arg to the API (e.g. `claw prompt --help`) should show
+                // top-level help instead. Subcommands that consume their own
+                // args (agents, mcp, plugins, skills) and local help-topic
+                // subcommands (status, sandbox, doctor) must NOT be intercepted
+                // here — they handle --help in their own dispatch paths.
                 wants_help = true;
                 index += 1;
             }
@@ -429,6 +500,32 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 base_commit = Some(flag[14..].to_string());
                 index += 1;
             }
+            "--reasoning-effort" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --reasoning-effort".to_string())?;
+                if !matches!(value.as_str(), "low" | "medium" | "high") {
+                    return Err(format!(
+                        "invalid value for --reasoning-effort: '{value}'; must be low, medium, or high"
+                    ));
+                }
+                reasoning_effort = Some(value.clone());
+                index += 2;
+            }
+            flag if flag.starts_with("--reasoning-effort=") => {
+                let value = &flag[19..];
+                if !matches!(value, "low" | "medium" | "high") {
+                    return Err(format!(
+                        "invalid value for --reasoning-effort: '{value}'; must be low, medium, or high"
+                    ));
+                }
+                reasoning_effort = Some(value.to_string());
+                index += 1;
+            }
+            "--allow-broad-cwd" => {
+                allow_broad_cwd = true;
+                index += 1;
+            }
             "-p" => {
                 // Claw Code compat: -p "prompt" = one-shot prompt
                 let prompt = args[index + 1..].join(" ");
@@ -444,6 +541,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                         .unwrap_or_else(default_permission_mode),
                     compact,
                     base_commit: base_commit.clone(),
+                    reasoning_effort: reasoning_effort.clone(),
+                    allow_broad_cwd,
                 });
             }
             "--print" => {
@@ -497,11 +596,35 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
 
     if rest.is_empty() {
         let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
+        // When stdin is not a terminal (pipe/redirect) and no prompt is given on the
+        // command line, read stdin as the prompt and dispatch as a one-shot Prompt
+        // rather than starting the interactive REPL (which would consume the pipe and
+        // print the startup banner, then exit without sending anything to the API).
+        if !std::io::stdin().is_terminal() {
+            let mut buf = String::new();
+            let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf);
+            let piped = buf.trim().to_string();
+            if !piped.is_empty() {
+                return Ok(CliAction::Prompt {
+                    model,
+                    prompt: piped,
+                    allowed_tools,
+                    permission_mode,
+                    output_format,
+                    compact: false,
+                    base_commit,
+                    reasoning_effort,
+                    allow_broad_cwd,
+                });
+            }
+        }
         return Ok(CliAction::Repl {
             model,
             allowed_tools,
             permission_mode,
             base_commit,
+            reasoning_effort: reasoning_effort.clone(),
+            allow_broad_cwd,
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
@@ -540,6 +663,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     permission_mode,
                     compact,
                     base_commit,
+                    reasoning_effort: reasoning_effort.clone(),
+                    allow_broad_cwd,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -565,6 +690,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 permission_mode,
                 compact,
                 base_commit: base_commit.clone(),
+                reasoning_effort: reasoning_effort.clone(),
+                allow_broad_cwd,
             })
         }
         other if other.starts_with('/') => parse_direct_slash_cli_action(
@@ -575,6 +702,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             permission_mode,
             compact,
             base_commit,
+            reasoning_effort,
+            allow_broad_cwd,
         ),
         _other => Ok(CliAction::Prompt {
             prompt: rest.join(" "),
@@ -584,6 +713,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             permission_mode,
             compact,
             base_commit,
+            reasoning_effort: reasoning_effort.clone(),
+            allow_broad_cwd,
         }),
     }
 }
@@ -677,6 +808,8 @@ fn parse_direct_slash_cli_action(
     permission_mode: PermissionMode,
     compact: bool,
     base_commit: Option<String>,
+    reasoning_effort: Option<String>,
+    allow_broad_cwd: bool,
 ) -> Result<CliAction, String> {
     let raw = rest.join(" ");
     match SlashCommand::parse(&raw) {
@@ -704,6 +837,8 @@ fn parse_direct_slash_cli_action(
                     permission_mode,
                     compact,
                     base_commit,
+                    reasoning_effort: reasoning_effort.clone(),
+                    allow_broad_cwd,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -1339,16 +1474,16 @@ fn run_worker_state(output_format: CliOutputFormat) -> Result<(), Box<dyn std::e
     let cwd = env::current_dir()?;
     let state_path = cwd.join(".claw").join("worker-state.json");
     if !state_path.exists() {
-        match output_format {
-            CliOutputFormat::Text => {
-                println!("No worker state file found at {}", state_path.display())
-            }
-            CliOutputFormat::Json => println!(
-                "{}",
-                serde_json::json!({"error": "no_state_file", "path": state_path.display().to_string()})
-            ),
-        }
-        return Ok(());
+        // Emit a structured error, then return Err so the process exits 1.
+        // Callers (scripts, CI) need a non-zero exit to detect "no state" without
+        // parsing prose output.
+        // Let the error propagate to main() which will format it correctly
+        // (prose for text mode, JSON envelope for --output-format json).
+        return Err(format!(
+            "no worker state file found at {} — run a worker first",
+            state_path.display()
+        )
+        .into());
     }
     let raw = std::fs::read_to_string(&state_path)?;
     match output_format {
@@ -1528,6 +1663,16 @@ fn check_config_health(
 ) -> DiagnosticCheck {
     let discovered = config_loader.discover();
     let discovered_count = discovered.len();
+    // Separate candidate paths that actually exist from those that don't.
+    // Showing non-existent paths as "Discovered file" implies they loaded
+    // but something went wrong, which is confusing. We only surface paths
+    // that exist on disk as discovered; non-existent ones are silently
+    // omitted from the display (they are just the standard search locations).
+    let present_paths: Vec<String> = discovered
+        .iter()
+        .filter(|e| e.path.exists())
+        .map(|e| e.path.display().to_string())
+        .collect();
     let discovered_paths = discovered
         .iter()
         .map(|entry| entry.path.display().to_string())
@@ -1535,10 +1680,11 @@ fn check_config_health(
     match config {
         Ok(runtime_config) => {
             let loaded_entries = runtime_config.loaded_entries();
+            let loaded_count = loaded_entries.len();
+            let present_count = present_paths.len();
             let mut details = vec![format!(
                 "Config files      loaded {}/{}",
-                loaded_entries.len(),
-                discovered_count
+                loaded_count, present_count
             )];
             if let Some(model) = runtime_config.model() {
                 details.push(format!("Resolved model    {model}"));
@@ -1547,39 +1693,29 @@ fn check_config_health(
                 "MCP servers       {}",
                 runtime_config.mcp().servers().len()
             ));
-            if discovered_paths.is_empty() {
-                details.push("Discovered files  <none>".to_string());
+            if present_paths.is_empty() {
+                details.push("Discovered files  <none> (defaults active)".to_string());
             } else {
                 details.extend(
-                    discovered_paths
+                    present_paths
                         .iter()
                         .map(|path| format!("Discovered file   {path}")),
                 );
             }
             DiagnosticCheck::new(
                 "Config",
-                if discovered_count == 0 {
-                    DiagnosticLevel::Warn
-                } else {
-                    DiagnosticLevel::Ok
-                },
-                if discovered_count == 0 {
-                    "no config files were found; defaults are active"
+                DiagnosticLevel::Ok,
+                if present_count == 0 {
+                    "no config files present; defaults are active"
                 } else {
                     "runtime config loaded successfully"
                 },
             )
             .with_details(details)
             .with_data(Map::from_iter([
-                ("discovered_files".to_string(), json!(discovered_paths)),
-                (
-                    "discovered_files_count".to_string(),
-                    json!(discovered_count),
-                ),
-                (
-                    "loaded_config_files".to_string(),
-                    json!(loaded_entries.len()),
-                ),
+                ("discovered_files".to_string(), json!(present_paths)),
+                ("discovered_files_count".to_string(), json!(present_count)),
+                ("loaded_config_files".to_string(), json!(loaded_count)),
                 ("resolved_model".to_string(), json!(runtime_config.model())),
                 (
                     "mcp_servers".to_string(),
@@ -1804,6 +1940,13 @@ fn looks_like_slash_command_token(token: &str) -> bool {
 
 fn dump_manifests(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
     let workspace_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    // Surface the resolved path in the error so users can diagnose missing
+    // manifest files without guessing what path the binary expected.
+    // ROADMAP #45: this path is only correct when running from the build tree;
+    // a proper fix would ship manifests alongside the binary.
+    let resolved = workspace_dir
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_dir.clone());
     let paths = UpstreamPaths::from_workspace_dir(&workspace_dir);
     match extract_manifest(&paths) {
         Ok(manifest) => {
@@ -1825,7 +1968,11 @@ fn dump_manifests(output_format: CliOutputFormat) -> Result<(), Box<dyn std::err
             }
             Ok(())
         }
-        Err(error) => Err(format!("failed to extract manifests: {error}").into()),
+        Err(error) => Err(format!(
+            "failed to extract manifests: {error}\n  looked in: {}",
+            resolved.display()
+        )
+        .into()),
     }
 }
 
@@ -2108,11 +2255,33 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
         let command = match SlashCommand::parse(raw_command) {
             Ok(Some(command)) => command,
             Ok(None) => {
-                eprintln!("unsupported resumed command: {raw_command}");
+                if output_format == CliOutputFormat::Json {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "error",
+                            "error": format!("unsupported resumed command: {raw_command}"),
+                            "command": raw_command,
+                        })
+                    );
+                } else {
+                    eprintln!("unsupported resumed command: {raw_command}");
+                }
                 std::process::exit(2);
             }
             Err(error) => {
-                eprintln!("{error}");
+                if output_format == CliOutputFormat::Json {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "error",
+                            "error": error.to_string(),
+                            "command": raw_command,
+                        })
+                    );
+                } else {
+                    eprintln!("{error}");
+                }
                 std::process::exit(2);
             }
         };
@@ -2138,7 +2307,18 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                 }
             }
             Err(error) => {
-                eprintln!("{error}");
+                if output_format == CliOutputFormat::Json {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "error",
+                            "error": error.to_string(),
+                            "command": raw_command,
+                        })
+                    );
+                } else {
+                    eprintln!("{error}");
+                }
                 std::process::exit(2);
             }
         }
@@ -2488,7 +2668,7 @@ fn run_resume_command(
         SlashCommand::Help => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_repl_help()),
-            json: None,
+            json: Some(serde_json::json!({ "kind": "help", "text": render_repl_help() })),
         }),
         SlashCommand::Compact => {
             let result = runtime::compact_session(
@@ -2505,7 +2685,12 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: result.compacted_session,
                 message: Some(format_compact_report(removed, kept, skipped)),
-                json: None,
+                json: Some(serde_json::json!({
+                    "kind": "compact",
+                    "skipped": skipped,
+                    "removed_messages": removed,
+                    "kept_messages": kept,
+                })),
             })
         }
         SlashCommand::Clear { confirm } => {
@@ -2515,7 +2700,11 @@ fn run_resume_command(
                     message: Some(
                         "clear: confirmation required; rerun with /clear --confirm".to_string(),
                     ),
-                    json: None,
+                    json: Some(serde_json::json!({
+                        "kind": "error",
+                        "error": "confirmation required",
+                        "hint": "rerun with /clear --confirm",
+                    })),
                 });
             }
             let backup_path = write_session_clear_backup(session, session_path)?;
@@ -2531,7 +2720,13 @@ fn run_resume_command(
                     backup_path.display(),
                     session_path.display()
                 )),
-                json: None,
+                json: Some(serde_json::json!({
+                    "kind": "clear",
+                    "previous_session_id": previous_session_id,
+                    "new_session_id": new_session_id,
+                    "backup": backup_path.display().to_string(),
+                    "session_file": session_path.display().to_string(),
+                })),
             })
         }
         SlashCommand::Status => {
@@ -2553,7 +2748,7 @@ fn run_resume_command(
                     &context,
                 )),
                 json: Some(status_json_value(
-                    "restored-session",
+                    None,
                     StatusUsage {
                         message_count: session.messages.len(),
                         turns: tracker.turns(),
@@ -2582,14 +2777,25 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(format_cost_report(usage)),
-                json: None,
+                json: Some(serde_json::json!({
+                    "kind": "cost",
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": usage.cache_read_input_tokens,
+                    "total_tokens": usage.total_tokens(),
+                })),
             })
         }
-        SlashCommand::Config { section } => Ok(ResumeCommandOutcome {
-            session: session.clone(),
-            message: Some(render_config_report(section.as_deref())?),
-            json: None,
-        }),
+        SlashCommand::Config { section } => {
+            let message = render_config_report(section.as_deref())?;
+            let json = render_config_json(section.as_deref())?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(message),
+                json: Some(json),
+            })
+        }
         SlashCommand::Mcp { action, target } => {
             let cwd = env::current_dir()?;
             let args = match (action.as_deref(), target.as_deref()) {
@@ -2607,7 +2813,7 @@ fn run_resume_command(
         SlashCommand::Memory => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_memory_report()?),
-            json: None,
+            json: Some(render_memory_json()?),
         }),
         SlashCommand::Init => {
             let message = init_claude_md()?;
@@ -2617,13 +2823,16 @@ fn run_resume_command(
                 json: Some(init_json_value(&message)),
             })
         }
-        SlashCommand::Diff => Ok(ResumeCommandOutcome {
-            session: session.clone(),
-            message: Some(render_diff_report_for(
-                session_path.parent().unwrap_or_else(|| Path::new(".")),
-            )?),
-            json: None,
-        }),
+        SlashCommand::Diff => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let message = render_diff_report_for(&cwd)?;
+            let json = render_diff_json_for(&cwd)?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(message),
+                json: Some(json),
+            })
+        }
         SlashCommand::Version => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_version_report()),
@@ -2663,19 +2872,46 @@ fn run_resume_command(
                 json: Some(handle_skills_slash_command_json(args.as_deref(), &cwd)?),
             })
         }
-        SlashCommand::Doctor => Ok(ResumeCommandOutcome {
-            session: session.clone(),
-            message: Some(render_doctor_report()?.render()),
-            json: None,
-        }),
+        SlashCommand::Doctor => {
+            let report = render_doctor_report()?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(report.render()),
+                json: Some(report.json_value()),
+            })
+        }
+        SlashCommand::Stats => {
+            let usage = UsageTracker::from_session(session).cumulative_usage();
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(format_cost_report(usage)),
+                json: Some(serde_json::json!({
+                    "kind": "stats",
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": usage.cache_read_input_tokens,
+                    "total_tokens": usage.total_tokens(),
+                })),
+            })
+        }
         SlashCommand::History { count } => {
             let limit = parse_history_count(count.as_deref())
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
             let entries = collect_session_prompt_history(session);
+            let shown: Vec<_> = entries.iter().rev().take(limit).rev().collect();
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(render_prompt_history_report(&entries, limit)),
-                json: None,
+                json: Some(serde_json::json!({
+                    "kind": "history",
+                    "total": entries.len(),
+                    "showing": shown.len(),
+                    "entries": shown.iter().map(|e| serde_json::json!({
+                        "timestamp_ms": e.timestamp_ms,
+                        "text": e.text,
+                    })).collect::<Vec<_>>(),
+                })),
             })
         }
         SlashCommand::Unknown(name) => Err(format_unknown_slash_command(name).into()),
@@ -2695,7 +2931,6 @@ fn run_resume_command(
         | SlashCommand::Logout
         | SlashCommand::Vim
         | SlashCommand::Upgrade
-        | SlashCommand::Stats
         | SlashCommand::Share
         | SlashCommand::Feedback
         | SlashCommand::Files
@@ -2733,9 +2968,85 @@ fn run_resume_command(
     }
 }
 
-/// Stale-base preflight: verify the worktree HEAD matches the expected base
-/// commit (from `--base-commit` flag or `.claw-base` file). Emits a warning to
-/// stderr when the HEAD has diverged.
+/// Detect if the current working directory is "broad" (home directory or
+/// filesystem root). Returns the cwd path if broad, None otherwise.
+fn detect_broad_cwd() -> Option<PathBuf> {
+    let Ok(cwd) = env::current_dir() else {
+        return None;
+    };
+    let is_home = env::var_os("HOME")
+        .map(|h| PathBuf::from(h) == cwd)
+        .unwrap_or(false);
+    let is_root = cwd.parent().is_none();
+    if is_home || is_root {
+        Some(cwd)
+    } else {
+        None
+    }
+}
+
+/// Enforce the broad-CWD policy: when running from home or root, either
+/// require the --allow-broad-cwd flag, or prompt for confirmation (interactive),
+/// or exit with an error (non-interactive).
+fn enforce_broad_cwd_policy(
+    allow_broad_cwd: bool,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if allow_broad_cwd {
+        return Ok(());
+    }
+    let Some(cwd) = detect_broad_cwd() else {
+        return Ok(());
+    };
+
+    let is_interactive = io::stdin().is_terminal();
+
+    if is_interactive {
+        // Interactive mode: print warning and ask for confirmation
+        eprintln!(
+            "Warning: claw is running from a very broad directory ({}).\n\
+             The agent can read and search everything under this path.\n\
+             Consider running from inside your project: cd /path/to/project && claw",
+            cwd.display()
+        );
+        eprint!("Continue anyway? [y/N]: ");
+        io::stderr().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let trimmed = input.trim().to_lowercase();
+        if trimmed != "y" && trimmed != "yes" {
+            eprintln!("Aborted.");
+            std::process::exit(0);
+        }
+        Ok(())
+    } else {
+        // Non-interactive mode: exit with error (JSON or text)
+        let message = format!(
+            "claw is running from a very broad directory ({}). \
+             The agent can read and search everything under this path. \
+             Use --allow-broad-cwd to proceed anyway, \
+             or run from inside your project: cd /path/to/project && claw",
+            cwd.display()
+        );
+        match output_format {
+            CliOutputFormat::Json => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "type": "error",
+                        "error": message,
+                    })
+                );
+            }
+            CliOutputFormat::Text => {
+                eprintln!("error: {message}");
+            }
+        }
+        std::process::exit(1);
+    }
+}
+
 fn run_stale_base_preflight(flag_value: Option<&str>) {
     let cwd = match env::current_dir() {
         Ok(cwd) => cwd,
@@ -2753,10 +3064,14 @@ fn run_repl(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     base_commit: Option<String>,
+    reasoning_effort: Option<String>,
+    allow_broad_cwd: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+    cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
@@ -2784,6 +3099,26 @@ fn run_repl(
                     Ok(None) => {}
                     Err(error) => {
                         eprintln!("{error}");
+                        continue;
+                    }
+                }
+                // Bare-word skill dispatch: if the first token of the input
+                // matches a known skill name, invoke it as `/skills <input>`
+                // rather than forwarding raw text to the LLM (ROADMAP #36).
+                let bare_first_token = trimmed.split_whitespace().next().unwrap_or_default();
+                let looks_like_skill_name = !bare_first_token.is_empty()
+                    && !bare_first_token.starts_with('/')
+                    && bare_first_token
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '-' || c == '_');
+                if looks_like_skill_name {
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    if let Ok(SkillSlashDispatch::Invoke(prompt)) =
+                        resolve_skill_invocation(&cwd, Some(&trimmed))
+                    {
+                        editor.push_history(input);
+                        cli.record_prompt_history(&trimmed);
+                        cli.run_turn(&prompt)?;
                         continue;
                     }
                 }
@@ -3339,6 +3674,12 @@ impl LiveCli {
         Ok(cli)
     }
 
+    fn set_reasoning_effort(&mut self, effort: Option<String>) {
+        if let Some(rt) = self.runtime.runtime.as_mut() {
+            rt.api_client_mut().set_reasoning_effort(effort);
+        }
+    }
+
     fn startup_banner(&self) -> String {
         let cwd = env::current_dir().map_or_else(
             |_| "<unknown>".to_string(),
@@ -3647,11 +3988,15 @@ impl LiveCli {
                 self.print_prompt_history(count.as_deref());
                 false
             }
+            SlashCommand::Stats => {
+                let usage = UsageTracker::from_session(self.runtime.session()).cumulative_usage();
+                println!("{}", format_cost_report(usage));
+                false
+            }
             SlashCommand::Login
             | SlashCommand::Logout
             | SlashCommand::Vim
             | SlashCommand::Upgrade
-            | SlashCommand::Stats
             | SlashCommand::Share
             | SlashCommand::Feedback
             | SlashCommand::Files
@@ -3686,7 +4031,8 @@ impl LiveCli {
             | SlashCommand::Tag { .. }
             | SlashCommand::OutputStyle { .. }
             | SlashCommand::AddDir { .. } => {
-                eprintln!("Command registered but not yet implemented.");
+                let cmd_name = command.slash_name();
+                eprintln!("{cmd_name} is not yet implemented in this build.");
                 false
             }
             SlashCommand::Unknown(name) => {
@@ -4400,6 +4746,22 @@ fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std
             return Ok(path);
         }
     }
+    // Backward compatibility: pre-isolation sessions were stored at
+    // `.claw/sessions/<id>.{jsonl,json}` without the per-workspace hash
+    // subdirectory. Walk up from `directory` to the `.claw/sessions/` root
+    // and try the flat layout as a fallback so users do not lose access
+    // to their pre-upgrade managed sessions.
+    if let Some(legacy_root) = directory
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
+    {
+        for extension in [PRIMARY_SESSION_EXTENSION, LEGACY_SESSION_EXTENSION] {
+            let path = legacy_root.join(format!("{session_id}.{extension}"));
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+    }
     Err(format_missing_session_reference(session_id).into())
 }
 
@@ -4411,9 +4773,14 @@ fn is_managed_session_file(path: &Path) -> bool {
         })
 }
 
-fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
-    let mut sessions = Vec::new();
-    for entry in fs::read_dir(sessions_dir()?)? {
+fn collect_sessions_from_dir(
+    directory: &Path,
+    sessions: &mut Vec<ManagedSessionSummary>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !directory.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
         if !is_managed_session_file(&path) {
@@ -4463,6 +4830,24 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
             branch_name,
         });
     }
+    Ok(())
+}
+
+fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
+    let mut sessions = Vec::new();
+    let primary_dir = sessions_dir()?;
+    collect_sessions_from_dir(&primary_dir, &mut sessions)?;
+
+    // Backward compatibility: include sessions stored in the pre-isolation
+    // flat `.claw/sessions/` root so users do not lose access to existing
+    // managed sessions after the workspace-hashed subdirectory rollout.
+    if let Some(legacy_root) = primary_dir
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
+    {
+        collect_sessions_from_dir(legacy_root, &mut sessions)?;
+    }
+
     sessions.sort_by(|left, right| {
         right
             .modified_epoch_millis
@@ -4602,7 +4987,7 @@ fn render_repl_help() -> String {
         "  Browse sessions      /session list".to_string(),
         "  Show prompt history  /history [count]".to_string(),
         String::new(),
-        render_slash_command_help(),
+        render_slash_command_help_filtered(STUB_COMMANDS),
     ]
     .join(
         "
@@ -4631,7 +5016,7 @@ fn print_status_snapshot(
         CliOutputFormat::Json => println!(
             "{}",
             serde_json::to_string_pretty(&status_json_value(
-                model,
+                Some(model),
                 usage,
                 permission_mode.as_str(),
                 &context,
@@ -4642,7 +5027,7 @@ fn print_status_snapshot(
 }
 
 fn status_json_value(
-    model: &str,
+    model: Option<&str>,
     usage: StatusUsage,
     permission_mode: &str,
     context: &StatusContext,
@@ -4670,6 +5055,11 @@ fn status_json_value(
             "unstaged_files": context.git_summary.unstaged_files,
             "untracked_files": context.git_summary.untracked_files,
             "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
+            "session_id": context.session_path.as_ref().and_then(|path| {
+                // Session files are named <session-id>.jsonl directly under
+                // .claw/sessions/. Extract the stem (drop the .jsonl extension).
+                path.file_stem().map(|n| n.to_string_lossy().into_owned())
+            }),
             "loaded_config_files": context.loaded_config_files,
             "discovered_config_files": context.discovered_config_files,
             "memory_file_count": context.memory_file_count,
@@ -4996,6 +5386,49 @@ fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::er
     ))
 }
 
+fn render_config_json(
+    _section: Option<&str>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let discovered = loader.discover();
+    let runtime_config = loader.load()?;
+
+    let loaded_paths: Vec<_> = runtime_config
+        .loaded_entries()
+        .iter()
+        .map(|e| e.path.display().to_string())
+        .collect();
+
+    let files: Vec<_> = discovered
+        .iter()
+        .map(|e| {
+            let source = match e.source {
+                ConfigSource::User => "user",
+                ConfigSource::Project => "project",
+                ConfigSource::Local => "local",
+            };
+            let loaded = runtime_config
+                .loaded_entries()
+                .iter()
+                .any(|le| le.path == e.path);
+            serde_json::json!({
+                "path": e.path.display().to_string(),
+                "source": source,
+                "loaded": loaded,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "kind": "config",
+        "cwd": cwd.display().to_string(),
+        "loaded_files": loaded_paths.len(),
+        "merged_keys": runtime_config.merged().len(),
+        "files": files,
+    }))
+}
+
 fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let project_context = ProjectContext::discover(&cwd, DEFAULT_DATE)?;
@@ -5033,6 +5466,28 @@ fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
         "
 ",
     ))
+}
+
+fn render_memory_json() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let project_context = ProjectContext::discover(&cwd, DEFAULT_DATE)?;
+    let files: Vec<_> = project_context
+        .instruction_files
+        .iter()
+        .map(|f| {
+            json!({
+                "path": f.path.display().to_string(),
+                "lines": f.content.lines().count(),
+                "preview": f.content.lines().next().unwrap_or("").trim(),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "kind": "memory",
+        "cwd": cwd.display().to_string(),
+        "instruction_files": files.len(),
+        "files": files,
+    }))
 }
 
 fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
@@ -5073,6 +5528,21 @@ fn render_diff_report() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    // Verify we are inside a git repository before calling `git diff`.
+    // Running `git diff --cached` outside a git tree produces a misleading
+    // "unknown option `cached`" error because git falls back to --no-index mode.
+    let in_git_repo = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(cwd)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !in_git_repo {
+        return Ok(format!(
+            "Diff\n  Result           no git repository\n  Detail           {} is not inside a git project",
+            cwd.display()
+        ));
+    }
     let staged = run_git_diff_command_in(cwd, &["diff", "--cached"])?;
     let unstaged = run_git_diff_command_in(cwd, &["diff"])?;
     if staged.trim().is_empty() && unstaged.trim().is_empty() {
@@ -5091,6 +5561,30 @@ fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Erro
     }
 
     Ok(format!("Diff\n\n{}", sections.join("\n\n")))
+}
+
+fn render_diff_json_for(cwd: &Path) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let in_git_repo = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(cwd)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !in_git_repo {
+        return Ok(serde_json::json!({
+            "kind": "diff",
+            "result": "no_git_repo",
+            "detail": format!("{} is not inside a git project", cwd.display()),
+        }));
+    }
+    let staged = run_git_diff_command_in(cwd, &["diff", "--cached"])?;
+    let unstaged = run_git_diff_command_in(cwd, &["diff"])?;
+    Ok(serde_json::json!({
+        "kind": "diff",
+        "result": if staged.trim().is_empty() && unstaged.trim().is_empty() { "clean" } else { "changes" },
+        "staged": staged.trim(),
+        "unstaged": unstaged.trim(),
+    }))
 }
 
 fn run_git_diff_command_in(
@@ -6306,9 +6800,15 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
     }
 }
 
+// NOTE: Despite the historical name `AnthropicRuntimeClient`, this struct
+// now holds an `ApiProviderClient` which dispatches to Anthropic, xAI,
+// OpenAI, or DashScope at construction time based on
+// `detect_provider_kind(&model)`. The struct name is kept to avoid
+// churning `BuiltRuntime` and every Deref/DerefMut site that references
+// it. See ROADMAP #29 for the provider-dispatch routing fix.
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: ProviderClient,
+    client: ApiProviderClient,
     session_id: String,
     model: String,
     enable_tools: bool,
@@ -6316,6 +6816,7 @@ struct AnthropicRuntimeClient {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    reasoning_effort: Option<String>,
 }
 
 impl AnthropicRuntimeClient {
@@ -6328,16 +6829,51 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let provider = detect_provider_kind(&model);
-        let anthropic_auth = if matches!(provider, ProviderKind::Anthropic) {
-            Some(resolve_cli_auth_source()?)
-        } else {
-            None
+        // Dispatch to the correct provider at construction time.
+        // `ApiProviderClient` (exposed by the api crate as
+        // `ProviderClient`) is an enum over Anthropic / xAI / OpenAI
+        // variants, where xAI and OpenAI both use the OpenAI-compat
+        // wire format under the hood. We consult
+        // `detect_provider_kind(&resolved_model)` so model-name prefix
+        // routing (`openai/`, `gpt-`, `grok`, `qwen/`) wins over
+        // env-var presence.
+        //
+        // For Anthropic we build the client directly instead of going
+        // through `ApiProviderClient::from_model_with_anthropic_auth`
+        // so we can explicitly apply `api::read_base_url()` — that
+        // reads `ANTHROPIC_BASE_URL` and is required for the local
+        // mock-server test harness
+        // (`crates/rusty-claude-cli/tests/compact_output.rs`) to point
+        // claw at its fake Anthropic endpoint. We also attach a
+        // session-scoped prompt cache on the Anthropic path; the
+        // prompt cache is Anthropic-only so non-Anthropic variants
+        // skip it.
+        let resolved_model = api::resolve_model_alias(&model);
+        let client = match detect_provider_kind(&resolved_model) {
+            ProviderKind::Anthropic => {
+                let auth = resolve_cli_auth_source()?;
+                let inner = AnthropicClient::from_auth(auth)
+                    .with_base_url(api::read_base_url())
+                    .with_prompt_cache(PromptCache::new(session_id));
+                ApiProviderClient::Anthropic(inner)
+            }
+            ProviderKind::Xai | ProviderKind::OpenAi => {
+                // The api crate's `ProviderClient::from_model_with_anthropic_auth`
+                // with `None` for the anthropic auth routes via
+                // `detect_provider_kind` and builds an
+                // `OpenAiCompatClient::from_env` with the matching
+                // `OpenAiCompatConfig` (openai / xai / dashscope).
+                // That reads the correct API-key env var and BASE_URL
+                // override internally, so this one call covers OpenAI,
+                // OpenRouter, xAI, DashScope, Ollama, and any other
+                // OpenAI-compat endpoint users configure via
+                // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
+                ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+            }
         };
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: ProviderClient::from_model_with_anthropic_auth(&model, anthropic_auth)?
-                .with_prompt_cache(PromptCache::new(session_id)),
+            client,
             session_id: session_id.to_string(),
             model,
             enable_tools,
@@ -6345,7 +6881,12 @@ impl AnthropicRuntimeClient {
             allowed_tools,
             tool_registry,
             progress_reporter,
+            reasoning_effort: None,
         })
+    }
+
+    fn set_reasoning_effort(&mut self, effort: Option<String>) {
+        self.reasoning_effort = effort;
     }
 }
 
@@ -6392,6 +6933,7 @@ impl ApiClient for AnthropicRuntimeClient {
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
+            reasoning_effort: self.reasoning_effort.clone(),
             ..Default::default()
         };
 
@@ -6768,6 +7310,51 @@ fn collect_prompt_cache_events(summary: &runtime::TurnSummary) -> Vec<serde_json
         .collect()
 }
 
+/// Slash commands that are registered in the spec list but not yet implemented
+/// in this build. Used to filter both REPL completions and help output so the
+/// discovery surface only shows commands that actually work (ROADMAP #39).
+const STUB_COMMANDS: &[&str] = &[
+    "login",
+    "logout",
+    "vim",
+    "upgrade",
+    "stats",
+    "share",
+    "feedback",
+    "files",
+    "fast",
+    "exit",
+    "summary",
+    "desktop",
+    "brief",
+    "advisor",
+    "stickers",
+    "insights",
+    "thinkback",
+    "release-notes",
+    "security-review",
+    "keybindings",
+    "privacy-settings",
+    "plan",
+    "review",
+    "tasks",
+    "theme",
+    "voice",
+    "usage",
+    "rename",
+    "copy",
+    "hooks",
+    "context",
+    "color",
+    "effort",
+    "branch",
+    "rewind",
+    "ide",
+    "tag",
+    "output-style",
+    "add-dir",
+];
+
 fn slash_command_completion_candidates_with_sessions(
     model: &str,
     active_session_id: Option<&str>,
@@ -6776,9 +7363,14 @@ fn slash_command_completion_candidates_with_sessions(
     let mut completions = BTreeSet::new();
 
     for spec in slash_command_specs() {
+        if STUB_COMMANDS.contains(&spec.name) {
+            continue;
+        }
         completions.insert(format!("/{}", spec.name));
         for alias in spec.aliases {
-            completions.insert(format!("/{alias}"));
+            if !STUB_COMMANDS.contains(alias) {
+                completions.insert(format!("/{alias}"));
+            }
         }
     }
 
@@ -7367,7 +7959,12 @@ fn response_to_events(
     Ok(events)
 }
 
-fn push_prompt_cache_record(client: &ProviderClient, events: &mut Vec<AssistantEvent>) {
+fn push_prompt_cache_record(client: &ApiProviderClient, events: &mut Vec<AssistantEvent>) {
+    // `ApiProviderClient::take_last_prompt_cache_record` is a pass-through
+    // to the Anthropic variant and returns `None` for OpenAI-compat /
+    // xAI variants, which do not have a prompt cache. So this helper
+    // remains a no-op on non-Anthropic providers without any extra
+    // branching here.
     if let Some(record) = client.take_last_prompt_cache_record() {
         if let Some(event) = prompt_cache_record_to_runtime_event(record) {
             events.push(AssistantEvent::PromptCache(event));
@@ -7662,7 +8259,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(out)?;
     writeln!(out, "Interactive slash commands:")?;
-    writeln!(out, "{}", render_slash_command_help())?;
+    writeln!(out, "{}", render_slash_command_help_filtered(STUB_COMMANDS))?;
     writeln!(out)?;
     let resume_commands = resume_supported_slash_commands()
         .into_iter()
@@ -7756,7 +8353,7 @@ mod tests {
         summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture, CliAction,
         CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
         InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry, SlashCommand,
-        StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -8080,6 +8677,8 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
     }
@@ -8243,6 +8842,8 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
     }
@@ -8332,6 +8933,8 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
     }
@@ -8361,6 +8964,8 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: true,
                 base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
     }
@@ -8402,6 +9007,8 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
     }
@@ -8479,6 +9086,8 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
                 base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
     }
@@ -8498,6 +9107,8 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
     }
@@ -8526,6 +9137,8 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
     }
@@ -8551,6 +9164,8 @@ mod tests {
                 ),
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
     }
@@ -8660,6 +9275,8 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
         assert_eq!(
@@ -9029,17 +9646,22 @@ mod tests {
     fn multi_word_prompt_still_uses_shorthand_prompt_mode() {
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        // Input is ["help", "me", "debug"] so the joined prompt shorthand
+        // must be "help me debug". A previous batch accidentally rewrote
+        // the expected string to "$help overview" (copy-paste slip).
         assert_eq!(
             parse_args(&["help".to_string(), "me".to_string(), "debug".to_string()])
                 .expect("prompt shorthand should still work"),
             CliAction::Prompt {
-                prompt: "$help overview".to_string(),
+                prompt: "help me debug".to_string(),
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
     }
@@ -9106,6 +9728,8 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
         assert_eq!(
@@ -9131,6 +9755,8 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
         let error = parse_args(&["/status".to_string()])
@@ -9350,7 +9976,9 @@ mod tests {
         assert!(help.contains("/diff"));
         assert!(help.contains("/version"));
         assert!(help.contains("/export [file]"));
-        assert!(help.contains("/session [list|switch <session-id>|fork [branch-name]]"));
+        // Batch 5 added `/session delete`; match on the stable core rather than
+        // the trailing bracket so future additions don't re-break this.
+        assert!(help.contains("/session [list|switch <session-id>|fork [branch-name]"));
         assert!(help.contains(
             "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
         ));
@@ -10883,6 +11511,58 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(source_root);
         std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn rejects_invalid_reasoning_effort_value() {
+        let err = parse_args(&[
+            "--reasoning-effort".to_string(),
+            "turbo".to_string(),
+            "prompt".to_string(),
+            "hello".to_string(),
+        ])
+        .unwrap_err();
+        assert!(
+            err.contains("invalid value for --reasoning-effort"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("turbo"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn accepts_valid_reasoning_effort_values() {
+        for value in ["low", "medium", "high"] {
+            let result = parse_args(&[
+                "--reasoning-effort".to_string(),
+                value.to_string(),
+                "prompt".to_string(),
+                "hello".to_string(),
+            ]);
+            assert!(
+                result.is_ok(),
+                "--reasoning-effort {value} should be accepted, got: {:?}",
+                result
+            );
+            if let Ok(CliAction::Prompt {
+                reasoning_effort, ..
+            }) = result
+            {
+                assert_eq!(reasoning_effort.as_deref(), Some(value));
+            }
+        }
+    }
+
+    #[test]
+    fn stub_commands_absent_from_repl_completions() {
+        let candidates =
+            slash_command_completion_candidates_with_sessions("claude-3-5-sonnet", None, vec![]);
+        for stub in STUB_COMMANDS {
+            let with_slash = format!("/{stub}");
+            assert!(
+                !candidates.contains(&with_slash),
+                "stub command {with_slash} should not appear in REPL completions"
+            );
+        }
     }
 }
 
