@@ -2,7 +2,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 use crate::types::{MessageRequest, MessageResponse};
@@ -47,6 +47,14 @@ pub struct ProviderMetadata {
 pub struct ModelTokenLimit {
     pub max_output_tokens: u32,
     pub context_window_tokens: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LaunchProfileOverride {
+    model: String,
+    context_window_tokens: u32,
+    max_output_tokens: u32,
 }
 
 const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
@@ -219,6 +227,9 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
 
 #[must_use]
 pub fn max_tokens_for_model(model: &str) -> u32 {
+    if let Some(limit) = launcher_model_token_limit(model) {
+        return limit.max_output_tokens;
+    }
     model_token_limit(model).map_or_else(
         || {
             let canonical = resolve_model_alias(model);
@@ -242,6 +253,9 @@ pub fn max_tokens_for_model_with_override(model: &str, plugin_override: Option<u
 
 #[must_use]
 pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
+    if let Some(limit) = launcher_model_token_limit(model) {
+        return Some(limit);
+    }
     let canonical = resolve_model_alias(model);
     match canonical.as_str() {
         "claude-opus-4-6" => Some(ModelTokenLimit {
@@ -270,6 +284,19 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
         }),
         _ => None,
     }
+}
+
+fn launcher_model_token_limit(model: &str) -> Option<ModelTokenLimit> {
+    let cwd = std::env::current_dir().ok()?;
+    let path = cwd.join(".claw-launch.json");
+    let body = std::fs::read_to_string(path).ok()?;
+    let launch_profile = serde_json::from_str::<LaunchProfileOverride>(&body).ok()?;
+    let requested = resolve_model_alias(model);
+    let recorded = resolve_model_alias(&launch_profile.model);
+    (requested == recorded).then_some(ModelTokenLimit {
+        max_output_tokens: launch_profile.max_output_tokens,
+        context_window_tokens: launch_profile.context_window_tokens,
+    })
 }
 
 pub fn preflight_message_request(request: &MessageRequest) -> Result<(), ApiError> {

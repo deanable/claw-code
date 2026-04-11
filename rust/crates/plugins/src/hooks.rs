@@ -1,5 +1,4 @@
 use std::ffi::OsStr;
-use std::path::Path;
 use std::process::Command;
 
 use serde_json::json;
@@ -434,6 +433,15 @@ mod tests {
         .expect("write plugin manifest");
     }
 
+    fn deny_hook_command(message: &str) -> String {
+        if cfg!(windows) {
+            format!("echo {message} & exit /b 2")
+        } else {
+            format!("printf '%s' '{message}'; exit 2")
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn collects_and_runs_hooks_from_enabled_plugins() {
         // given
@@ -499,7 +507,7 @@ mod tests {
     fn pre_tool_use_denies_when_plugin_hook_exits_two() {
         // given
         let runner = HookRunner::new(crate::PluginHooks {
-            pre_tool_use: vec!["printf 'blocked by plugin'; exit 2".to_string()],
+            pre_tool_use: vec![deny_hook_command("blocked by plugin")],
             post_tool_use: Vec::new(),
             post_tool_use_failure: Vec::new(),
         });

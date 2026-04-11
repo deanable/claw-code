@@ -35,6 +35,7 @@ impl Drop for EnvVarGuard {
     }
 }
 
+#[cfg(not(windows))]
 #[test]
 fn proxy_config_from_env_reads_uppercase_proxy_vars() {
     // given
@@ -154,6 +155,7 @@ fn build_client_with_proxy_url_config_succeeds() {
     assert!(result.is_ok());
 }
 
+#[cfg(not(windows))]
 #[test]
 fn proxy_config_from_env_prefers_uppercase_over_lowercase() {
     // given

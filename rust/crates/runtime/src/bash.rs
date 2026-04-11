@@ -200,8 +200,8 @@ fn prepare_command(
         return prepared;
     }
 
-    let mut prepared = Command::new("sh");
-    prepared.arg("-lc").arg(command).current_dir(cwd);
+    let mut prepared = platform_shell_command(command);
+    prepared.current_dir(cwd);
     if sandbox_status.filesystem_active {
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
@@ -227,13 +227,114 @@ fn prepare_tokio_command(
         return prepared;
     }
 
-    let mut prepared = TokioCommand::new("sh");
-    prepared.arg("-lc").arg(command).current_dir(cwd);
+    let mut prepared = platform_tokio_shell_command(command);
+    prepared.current_dir(cwd);
     if sandbox_status.filesystem_active {
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
     }
     prepared
+}
+
+fn platform_shell_command(command: &str) -> Command {
+    #[cfg(target_os = "windows")]
+    {
+        let command = normalize_windows_shell_command(command);
+        let mut prepared = Command::new("powershell");
+        prepared
+            .arg("-NoLogo")
+            .arg("-NoProfile")
+            .arg("-Command")
+            .arg(command);
+        prepared
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut prepared = Command::new("sh");
+        prepared.arg("-lc").arg(command);
+        prepared
+    }
+}
+
+fn platform_tokio_shell_command(command: &str) -> TokioCommand {
+    #[cfg(target_os = "windows")]
+    {
+        let command = normalize_windows_shell_command(command);
+        let mut prepared = TokioCommand::new("powershell");
+        prepared
+            .arg("-NoLogo")
+            .arg("-NoProfile")
+            .arg("-Command")
+            .arg(command);
+        prepared
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut prepared = TokioCommand::new("sh");
+        prepared.arg("-lc").arg(command);
+        prepared
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_windows_shell_command(command: &str) -> String {
+    let segments = command
+        .split("&&")
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(rewrite_windows_shell_segment)
+        .collect::<Vec<_>>();
+
+    if segments.is_empty() {
+        return command.to_string();
+    }
+
+    let mut normalized = String::new();
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 {
+            normalized.push_str("; if (-not $?) { exit 1 }; ");
+        }
+        normalized.push_str(segment);
+    }
+    normalized
+}
+
+#[cfg(not(target_os = "windows"))]
+fn normalize_windows_shell_command(command: &str) -> String {
+    command.to_string()
+}
+
+#[cfg(target_os = "windows")]
+fn rewrite_windows_shell_segment(segment: &str) -> String {
+    let trimmed = segment.trim();
+    if trimmed == "pwd" {
+        return "Get-Location".to_string();
+    }
+    if trimmed == "ls" {
+        return "Get-ChildItem".to_string();
+    }
+    if trimmed == "ls -la" || trimmed == "ls -al" || trimmed == "ls -lah" || trimmed == "ls -alh" {
+        return "Get-ChildItem -Force".to_string();
+    }
+    if let Some(rest) = trimmed.strip_prefix("ls ") {
+        if rest.starts_with("-la ") || rest.starts_with("-al ") {
+            return format!("Get-ChildItem -Force {}", &rest[4..]);
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("cat ") {
+        return format!("Get-Content {rest}");
+    }
+    if let Some(rest) = trimmed.strip_prefix("which ") {
+        return format!("Get-Command {rest}");
+    }
+    trimmed.to_string()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn rewrite_windows_shell_segment(segment: &str) -> String {
+    segment.to_string()
 }
 
 fn prepare_sandbox_dirs(cwd: &std::path::Path) {
@@ -246,6 +347,7 @@ mod tests {
     use super::{execute_bash, BashCommandInput};
     use crate::sandbox::FilesystemIsolationMode;
 
+    #[cfg(unix)]
     #[test]
     fn executes_simple_command() {
         let output = execute_bash(BashCommandInput {
@@ -266,6 +368,7 @@ mod tests {
         assert!(output.sandbox_status.is_some());
     }
 
+    #[cfg(unix)]
     #[test]
     fn disables_sandbox_when_requested() {
         let output = execute_bash(BashCommandInput {
@@ -282,6 +385,15 @@ mod tests {
         .expect("bash command should execute");
 
         assert!(!output.sandbox_status.expect("sandbox status").enabled);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn normalizes_common_bash_style_windows_commands() {
+        let normalized = super::normalize_windows_shell_command("pwd && ls -la");
+        assert!(normalized.contains("Get-Location"));
+        assert!(normalized.contains("Get-ChildItem -Force"));
+        assert!(normalized.contains("if (-not $?) { exit 1 }"));
     }
 }
 

@@ -2,6 +2,9 @@ use std::env;
 use std::process::Command;
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    embed_launcher_icon();
+
     // Get git SHA (short hash)
     let git_sha = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
@@ -14,14 +17,13 @@ fn main() {
                 None
             }
         })
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+        .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
 
-    println!("cargo:rustc-env=GIT_SHA={}", git_sha);
+    println!("cargo:rustc-env=GIT_SHA={git_sha}");
 
     // TARGET is always set by Cargo during build
     let target = env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
-    println!("cargo:rustc-env=TARGET={}", target);
+    println!("cargo:rustc-env=TARGET={target}");
 
     // Build date from SOURCE_DATE_EPOCH (reproducible builds) or current UTC date.
     // Intentionally ignoring time component to keep output deterministic within a day.
@@ -48,12 +50,21 @@ fn main() {
                         None
                     }
                 })
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| "unknown".to_string())
+                .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string())
         });
     println!("cargo:rustc-env=BUILD_DATE={build_date}");
 
     // Rerun if git state changes
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs");
+    println!("cargo:rerun-if-changed=../../../assets/openclaw.ico");
+}
+
+#[cfg(target_os = "windows")]
+fn embed_launcher_icon() {
+    let mut resource = winresource::WindowsResource::new();
+    resource.set_icon("../../../assets/openclaw.ico");
+    if let Err(error) = resource.compile() {
+        panic!("failed to embed launcher icon: {error}");
+    }
 }

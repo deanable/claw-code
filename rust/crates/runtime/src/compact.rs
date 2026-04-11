@@ -135,8 +135,7 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
             let starts_with_tool_result = first_preserved
                 .blocks
                 .first()
-                .map(|b| matches!(b, ContentBlock::ToolResult { .. }))
-                .unwrap_or(false);
+                .is_some_and(|b| matches!(b, ContentBlock::ToolResult { .. }));
             if !starts_with_tool_result {
                 break;
             }
@@ -555,7 +554,7 @@ fn extract_summary_timeline(summary: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_key_files, compact_session, estimate_session_tokens, format_compact_summary,
+        collect_key_files, compact_session, format_compact_summary,
         get_compact_continuation_message, infer_pending_work, should_compact, CompactionConfig,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};

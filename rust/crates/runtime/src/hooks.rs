@@ -633,7 +633,7 @@ fn format_hook_failure(command: &str, code: i32, stdout: Option<&str>, stderr: &
 
 fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(windows)]
-    let mut command_builder = {
+    let command_builder = {
         let mut command_builder = Command::new("cmd");
         command_builder.arg("/C").arg(command);
         CommandWithStdin::new(command_builder)
@@ -734,6 +734,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn allows_exit_code_zero_and_captures_stdout() {
         let runner = HookRunner::new(RuntimeHookConfig::new(
@@ -747,6 +748,7 @@ mod tests {
         assert_eq!(result, HookRunResult::allow(vec!["pre ok".to_string()]));
     }
 
+    #[cfg(unix)]
     #[test]
     fn denies_exit_code_two() {
         let runner = HookRunner::new(RuntimeHookConfig::new(
@@ -783,6 +785,7 @@ mod tests {
             .any(|message| message.contains("warning hook")));
     }
 
+    #[cfg(unix)]
     #[test]
     fn parses_pre_hook_permission_override_and_updated_input() {
         let runner = HookRunner::new(RuntimeHookConfig::new(
@@ -804,6 +807,7 @@ mod tests {
         assert!(result.messages().iter().any(|message| message == "updated"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn runs_post_tool_use_failure_hooks() {
         // given
@@ -850,6 +854,7 @@ mod tests {
             .any(|message| message == "later failure hook"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn executes_hooks_in_configured_order() {
         // given
@@ -935,6 +940,7 @@ mod tests {
         assert!(!result.messages().iter().any(|message| message == "later"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn abort_signal_cancels_long_running_hook_and_reports_progress() {
         let runner = HookRunner::new(RuntimeHookConfig::new(

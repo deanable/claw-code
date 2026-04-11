@@ -3344,6 +3344,7 @@ mod tests {
         let _ = fs::remove_dir_all(source_root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn plugin_registry_runs_initialize_and_shutdown_for_enabled_plugins() {
         let config_home = temp_dir("lifecycle-home");
@@ -3367,6 +3368,7 @@ mod tests {
         let _ = fs::remove_dir_all(source_root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn aggregates_and_executes_plugin_tools() {
         let config_home = temp_dir("tool-home");

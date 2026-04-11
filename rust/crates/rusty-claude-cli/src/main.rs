@@ -3091,8 +3091,17 @@ fn run_repl(
                 }
                 match SlashCommand::parse(&trimmed) {
                     Ok(Some(command)) => {
-                        if cli.handle_repl_command(command)? {
-                            cli.persist_session()?;
+                        match cli.handle_repl_command(command) {
+                            Ok(should_persist) => {
+                                if should_persist {
+                                    if let Err(error) = cli.persist_session() {
+                                        print_repl_error(&*error);
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                print_repl_error(&*error);
+                            }
                         }
                         continue;
                     }
@@ -3118,13 +3127,17 @@ fn run_repl(
                     {
                         editor.push_history(input);
                         cli.record_prompt_history(&trimmed);
-                        cli.run_turn(&prompt)?;
+                        if let Err(error) = cli.run_turn(&prompt) {
+                            print_repl_error(&*error);
+                        }
                         continue;
                     }
                 }
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
-                cli.run_turn(&trimmed)?;
+                if let Err(error) = cli.run_turn(&trimmed) {
+                    print_repl_error(&*error);
+                }
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -3135,6 +3148,12 @@ fn run_repl(
     }
 
     Ok(())
+}
+
+fn print_repl_error(error: &dyn std::error::Error) {
+    eprintln!();
+    eprintln!("❌ {error}");
+    eprintln!();
 }
 
 #[derive(Debug, Clone)]
@@ -3694,6 +3713,7 @@ impl LiveCli {
             || "unknown".to_string(),
             |context| context.git_summary.headline(),
         );
+        let workspace_path = cwd.clone();
         let session_path = self.session.path.strip_prefix(Path::new(&cwd)).map_or_else(
             |_| self.session.path.display().to_string(),
             |path| path.display().to_string(),
@@ -3710,7 +3730,7 @@ impl LiveCli {
   \x1b[2mPermissions\x1b[0m      {}\n\
   \x1b[2mBranch\x1b[0m           {}\n\
   \x1b[2mWorkspace\x1b[0m        {}\n\
-  \x1b[2mDirectory\x1b[0m        {}\n\
+  \x1b[2mWorkspace Path\x1b[0m   {}\n\
   \x1b[2mSession\x1b[0m          {}\n\
   \x1b[2mAuto-save\x1b[0m        {}\n\n\
   Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
@@ -3718,7 +3738,7 @@ impl LiveCli {
             self.permission_mode.as_str(),
             git_branch,
             workspace,
-            cwd,
+            workspace_path,
             self.session.id,
             session_path,
         )
@@ -6942,7 +6962,7 @@ impl ApiClient for AnthropicRuntimeClient {
             // first stream event.  If the model does not respond within the
             // deadline we drop the stalled connection and re-send the request as
             // a continuation nudge (one retry only).
-            let max_attempts: usize = if is_post_tool { 2 } else { 1 };
+            let max_attempts: usize = if is_post_tool { 3 } else { 2 };
 
             for attempt in 1..=max_attempts {
                 let result = self
@@ -6958,11 +6978,21 @@ impl ApiClient for AnthropicRuntimeClient {
                         // re-sending the same request.
                         continue;
                     }
+                    Err(error)
+                        if error
+                            .to_string()
+                            .contains("transient provider failure before any response event")
+                            && attempt < max_attempts =>
+                    {
+                        continue;
+                    }
                     Err(error) => return Err(error),
                 }
             }
 
-            Err(RuntimeError::new("post-tool continuation nudge exhausted"))
+            Err(RuntimeError::new(
+                "retry budget exhausted while waiting for a stable provider response",
+            ))
         })
     }
 }
@@ -7002,7 +7032,17 @@ impl AnthropicRuntimeClient {
             let next = if apply_stall_timeout && !received_any_event {
                 match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
                     Ok(inner) => inner.map_err(|error| {
-                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                        if !received_any_event && error.is_retryable() {
+                            RuntimeError::new(format!(
+                                "transient provider failure before any response event: {}",
+                                format_user_visible_api_error(&self.session_id, &error)
+                            ))
+                        } else {
+                            RuntimeError::new(format_user_visible_api_error(
+                                &self.session_id,
+                                &error,
+                            ))
+                        }
                     })?,
                     Err(_elapsed) => {
                         return Err(RuntimeError::new(
@@ -7012,7 +7052,14 @@ impl AnthropicRuntimeClient {
                 }
             } else {
                 stream.next_event().await.map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                    if !received_any_event && error.is_retryable() {
+                        RuntimeError::new(format!(
+                            "transient provider failure before any response event: {}",
+                            format_user_visible_api_error(&self.session_id, &error)
+                        ))
+                    } else {
+                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                    }
                 })?
             };
 
@@ -10585,6 +10632,7 @@ UU conflicted.rs",
         assert!(help.contains("claw --resume latest /status /diff /export notes.txt"));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn managed_sessions_default_to_jsonl_and_resolve_legacy_json() {
         let _guard = cwd_lock().lock().expect("cwd lock");
@@ -10623,6 +10671,7 @@ UU conflicted.rs",
         std::fs::remove_dir_all(workspace).expect("workspace should clean up");
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn latest_session_alias_resolves_most_recent_managed_session() {
         let _guard = cwd_lock().lock().expect("cwd lock");
@@ -11294,21 +11343,19 @@ UU conflicted.rs",
         write_mcp_server_fixture(&script_path);
         fs::write(
             config_home.join("settings.json"),
-            format!(
-                r#"{{
-                  "mcpServers": {{
-                    "alpha": {{
-                      "command": "python3",
-                      "args": ["{}"]
-                    }},
-                    "broken": {{
-                      "command": "python3",
-                      "args": ["-c", "import sys; sys.exit(0)"]
-                    }}
-                  }}
-                }}"#,
-                script_path.to_string_lossy()
-            ),
+            serde_json::json!({
+                "mcpServers": {
+                    "alpha": {
+                        "command": if cfg!(windows) { "python" } else { "python3" },
+                        "args": [script_path.to_string_lossy()]
+                    },
+                    "broken": {
+                        "command": if cfg!(windows) { "python" } else { "python3" },
+                        "args": ["-c", "import sys; sys.exit(0)"]
+                    }
+                }
+            })
+            .to_string(),
         )
         .expect("write mcp settings");
 
@@ -11453,6 +11500,7 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(workspace);
     }
 
+    #[cfg(unix)]
     #[test]
     fn build_runtime_runs_plugin_lifecycle_init_and_shutdown() {
         // Serialize access to process-wide env vars so parallel tests that

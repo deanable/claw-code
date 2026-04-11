@@ -1022,6 +1022,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn denies_tool_use_when_pre_tool_hook_blocks() {
         struct SingleCallApiClient;
@@ -1084,6 +1085,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn denies_tool_use_when_pre_tool_hook_fails() {
         struct SingleCallApiClient;
@@ -1149,6 +1151,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn appends_post_tool_hook_feedback_to_tool_result() {
         struct TwoCallApiClient {
@@ -1224,6 +1227,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn appends_post_tool_use_failure_hook_feedback_to_tool_result() {
         struct TwoCallApiClient {

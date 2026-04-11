@@ -172,9 +172,16 @@ impl OpenAiCompatClient {
                     .get("code")
                     .and_then(|c| c.as_u64())
                     .map(|c| c as u16);
+                let status = reqwest::StatusCode::from_u16(code.unwrap_or(400))
+                    .unwrap_or(reqwest::StatusCode::BAD_REQUEST);
+                let retryable = is_retryable_error_payload(
+                    status,
+                    err_obj.get("type").and_then(|t| t.as_str()),
+                    Some(&msg),
+                    &body,
+                );
                 return Err(ApiError::Api {
-                    status: reqwest::StatusCode::from_u16(code.unwrap_or(400))
-                        .unwrap_or(reqwest::StatusCode::BAD_REQUEST),
+                    status,
                     error_type: err_obj
                         .get("type")
                         .and_then(|t| t.as_str())
@@ -182,7 +189,7 @@ impl OpenAiCompatClient {
                     message: Some(msg),
                     request_id,
                     body,
-                    retryable: false,
+                    retryable,
                 });
             }
         }
@@ -754,6 +761,25 @@ struct ErrorBody {
     message: Option<String>,
 }
 
+fn is_retryable_error_payload(
+    status: reqwest::StatusCode,
+    error_type: Option<&str>,
+    message: Option<&str>,
+    body: &str,
+) -> bool {
+    if is_retryable_status(status) {
+        return true;
+    }
+    error_type.is_some_and(|kind| kind.eq_ignore_ascii_case("provider_unavailable"))
+        || message.is_some_and(|text| {
+            text.to_ascii_lowercase()
+                .contains("network connection lost")
+        })
+        || body
+            .to_ascii_lowercase()
+            .contains("\"error_type\":\"provider_unavailable\"")
+}
+
 /// Returns true for models known to reject tuning parameters like temperature,
 /// top_p, frequency_penalty, and presence_penalty. These are typically
 /// reasoning/chain-of-thought models with fixed sampling.
@@ -1181,6 +1207,12 @@ fn parse_sse_frame(
                 .map(|c| c as u16);
             let status = reqwest::StatusCode::from_u16(code.unwrap_or(400))
                 .unwrap_or(reqwest::StatusCode::BAD_REQUEST);
+            let retryable = is_retryable_error_payload(
+                status,
+                err_obj.get("type").and_then(|t| t.as_str()),
+                Some(&msg),
+                &payload,
+            );
             return Err(ApiError::Api {
                 status,
                 error_type: err_obj
@@ -1190,7 +1222,7 @@ fn parse_sse_frame(
                 message: Some(msg),
                 request_id: None,
                 body: payload.to_string(),
-                retryable: false,
+                retryable,
             });
         }
     }
@@ -1246,7 +1278,16 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     let request_id = request_id_from_headers(response.headers());
     let body = response.text().await.unwrap_or_default();
     let parsed_error = serde_json::from_str::<ErrorEnvelope>(&body).ok();
-    let retryable = is_retryable_status(status);
+    let retryable = is_retryable_error_payload(
+        status,
+        parsed_error
+            .as_ref()
+            .and_then(|error| error.error.error_type.as_deref()),
+        parsed_error
+            .as_ref()
+            .and_then(|error| error.error.message.as_deref()),
+        &body,
+    );
 
     Err(ApiError::Api {
         status,
@@ -1293,8 +1334,8 @@ impl StringExt for String {
 mod tests {
     use super::{
         build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
-        normalize_finish_reason, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,
-        OpenAiCompatConfig,
+        is_retryable_error_payload, normalize_finish_reason, openai_tool_choice,
+        parse_tool_arguments, OpenAiCompatClient, OpenAiCompatConfig,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -1413,6 +1454,16 @@ mod tests {
             OpenAiCompatConfig::openai(),
         );
         assert!(payload.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn provider_unavailable_payloads_are_treated_as_retryable() {
+        assert!(is_retryable_error_payload(
+            reqwest::StatusCode::OK,
+            Some("provider_unavailable"),
+            Some("Network connection lost."),
+            r#"{"error":{"metadata":{"error_type":"provider_unavailable"}}}"#,
+        ));
     }
 
     #[test]
@@ -1658,6 +1709,7 @@ mod tests {
         use super::deserialize_null_as_empty_vec;
         #[derive(serde::Deserialize, Debug)]
         struct Delta {
+            #[allow(dead_code)]
             content: Option<String>,
             #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
             tool_calls: Vec<super::DeltaToolCall>,
@@ -1670,7 +1722,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// Regression: when building a multi-turn request where a prior assistant
     /// turn has no tool calls, the serialized assistant message must NOT include
     /// `tool_calls: []`. Some providers reject requests that carry an empty

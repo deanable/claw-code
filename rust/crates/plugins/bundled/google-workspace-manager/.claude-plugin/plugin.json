@@ -1,0 +1,291 @@
+{
+  "name": "google-workspace-manager",
+  "version": "0.1.0",
+  "description": "Manage Google Workspace accounts, Apps Script projects, deployments, and admin actions from Claw.",
+  "permissions": ["read", "write", "execute"],
+  "defaultEnabled": false,
+  "tools": [
+    {
+      "name": "google_workspace_configure_account",
+      "description": "Save or update a Google Workspace account profile for later use.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "account_name": { "type": "string" },
+          "client_secret_path": { "type": "string" },
+          "set_default": { "type": "boolean" },
+          "admin_email": { "type": "string" },
+          "scopes": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        },
+        "required": ["account_name", "client_secret_path"],
+        "additionalProperties": false
+      },
+      "command": "python",
+      "args": ["./tools/google_workspace_bridge.py", "configure-account"],
+      "requiredPermission": "workspace-write"
+    },
+    {
+      "name": "google_workspace_login",
+      "description": "Authenticate a saved Google Workspace account with OAuth and store a refresh token locally.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "account_name": { "type": "string" }
+        },
+        "required": ["account_name"],
+        "additionalProperties": false
+      },
+      "command": "python",
+      "args": ["./tools/google_workspace_bridge.py", "login"],
+      "requiredPermission": "workspace-write"
+    },
+    {
+      "name": "google_workspace_list_accounts",
+      "description": "List configured Google Workspace accounts and show which one is the default.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "command": "python",
+      "args": ["./tools/google_workspace_bridge.py", "list-accounts"],
+      "requiredPermission": "read-only"
+    },
+    {
+      "name": "google_workspace_delete_account",
+      "description": "Delete a saved Google Workspace account profile and its cached token.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "account_name": { "type": "string" }
+        },
+        "required": ["account_name"],
+        "additionalProperties": false
+      },
+      "command": "python",
+      "args": ["./tools/google_workspace_bridge.py", "delete-account"],
+      "requiredPermission": "workspace-write"
+    },
+    {
+      "name": "google_workspace_list_scripts",
+      "description": "List Apps Script projects visible to a configured account.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "account_name": { "type": "string" },
+          "query": { "type": "string" },
+          "page_size": { "type": "integer", "minimum": 1, "maximum": 200 }
+        },
+        "additionalProperties": false
+      },
+      "command": "python",
+      "args": ["./tools/google_workspace_bridge.py", "list-scripts"],
+      "requiredPermission": "read-only"
+    },
+    {
+      "name": "google_workspace_create_script_project",
+      "description": "Create a new Apps Script project and optionally seed its files.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "account_name": { "type": "string" },
+          "title": { "type": "string" },
+          "parent_id": { "type": "string" },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "type": { "type": "string" },
+                "source": { "type": "string" }
+              },
+              "required": ["name", "type", "source"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["title"],
+        "additionalProperties": false
+      },
+      "command": "python",
+      "args": ["./tools/google_workspace_bridge.py", "create-script-project"],
+      "requiredPermission": "workspace-write"
+    },
+    {
+      "name": "google_workspace_get_script_content",
+      "description": "Fetch the source files for an Apps Script project.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "account_name": { "type": "string" },
+          "script_id": { "type": "string" }
+        },
+        "required": ["script_id"],
+        "additionalProperties": false
+      },
+      "command": "python",
+      "args": ["./tools/google_workspace_bridge.py", "get-script-content"],
+      "requiredPermission": "read-only"
+    },
+    {
+      "name": "google_workspace_update_script_content",
+      "description": "Replace the source files for an Apps Script project.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "account_name": { "type": "string" },
+          "script_id": { "type": "string" },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "type": { "type": "string" },
+                "source": { "type": "string" }
+              },
+              "required": ["name", "type", "source"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["script_id", "files"],
+        "additionalProperties": false
+      },
+      "command": "python",
+      "args": ["./tools/google_workspace_bridge.py", "update-script-content"],
+      "requiredPermission": "workspace-write"
+    },
+    {
+      "name": "google_workspace_export_script_to_dir",
+      "description": "Export an Apps Script project into a local workspace directory.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "account_name": { "type": "string" },
+          "script_id": { "type": "string" },
+          "output_dir": { "type": "string" }
+        },
+        "required": ["script_id", "output_dir"],
+        "additionalProperties": false
+      },
+      "command": "python",
+      "args": ["./tools/google_workspace_bridge.py", "export-script-to-dir"],
+      "requiredPermission": "workspace-write"
+    },
+    {
+      "name": "google_workspace_import_dir_to_script",
+      "description": "Import local Apps Script source files from a workspace directory into a script project.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "account_name": { "type": "string" },
+          "script_id": { "type": "string" },
+          "input_dir": { "type": "string" }
+        },
+        "required": ["script_id", "input_dir"],
+        "additionalProperties": false
+      },
+      "command": "python",
+      "args": ["./tools/google_workspace_bridge.py", "import-dir-to-script"],
+      "requiredPermission": "workspace-write"
+    },
+    {
+      "name": "google_workspace_create_script_version",
+      "description": "Create a numbered Apps Script version for a project.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "account_name": { "type": "string" },
+          "script_id": { "type": "string" },
+          "description": { "type": "string" }
+        },
+        "required": ["script_id"],
+        "additionalProperties": false
+      },
+      "command": "python",
+      "args": ["./tools/google_workspace_bridge.py", "create-script-version"],
+      "requiredPermission": "workspace-write"
+    },
+    {
+      "name": "google_workspace_list_deployments",
+      "description": "List deployments for an Apps Script project.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "account_name": { "type": "string" },
+          "script_id": { "type": "string" }
+        },
+        "required": ["script_id"],
+        "additionalProperties": false
+      },
+      "command": "python",
+      "args": ["./tools/google_workspace_bridge.py", "list-deployments"],
+      "requiredPermission": "read-only"
+    },
+    {
+      "name": "google_workspace_deploy_script",
+      "description": "Create or update an Apps Script deployment.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "account_name": { "type": "string" },
+          "script_id": { "type": "string" },
+          "version_number": { "type": "integer", "minimum": 1 },
+          "description": { "type": "string" },
+          "manifest_file_name": { "type": "string" },
+          "deployment_id": { "type": "string" }
+        },
+        "required": ["script_id", "version_number"],
+        "additionalProperties": false
+      },
+      "command": "python",
+      "args": ["./tools/google_workspace_bridge.py", "deploy-script"],
+      "requiredPermission": "workspace-write"
+    },
+    {
+      "name": "google_workspace_run_script_function",
+      "description": "Run a function in an Apps Script API executable deployment.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "account_name": { "type": "string" },
+          "script_id": { "type": "string" },
+          "function": { "type": "string" },
+          "parameters": {
+            "type": "array",
+            "items": {}
+          },
+          "dev_mode": { "type": "boolean" }
+        },
+        "required": ["script_id", "function"],
+        "additionalProperties": false
+      },
+      "command": "python",
+      "args": ["./tools/google_workspace_bridge.py", "run-script-function"],
+      "requiredPermission": "danger-full-access"
+    },
+    {
+      "name": "google_workspace_list_users",
+      "description": "List Google Workspace users through the Admin SDK for an authenticated admin account.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "account_name": { "type": "string" },
+          "customer": { "type": "string" },
+          "domain": { "type": "string" },
+          "query": { "type": "string" },
+          "max_results": { "type": "integer", "minimum": 1, "maximum": 500 }
+        },
+        "additionalProperties": false
+      },
+      "command": "python",
+      "args": ["./tools/google_workspace_bridge.py", "list-users"],
+      "requiredPermission": "read-only"
+    }
+  ]
+}

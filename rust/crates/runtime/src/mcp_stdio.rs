@@ -1410,7 +1410,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::ErrorKind;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1443,18 +1442,45 @@ mod tests {
         std::env::temp_dir().join(format!("runtime-mcp-stdio-{nanos}-{unique_id}"))
     }
 
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("chmod");
+    }
+
+    #[cfg(not(unix))]
+    fn make_executable(_path: &Path) {}
+
+    fn python_command() -> &'static str {
+        if cfg!(windows) {
+            "python"
+        } else {
+            "python3"
+        }
+    }
+
     fn write_echo_script() -> PathBuf {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("temp dir");
-        let script_path = root.join("echo-mcp.sh");
+        let script_path = root.join("echo-mcp.py");
         fs::write(
             &script_path,
-            "#!/bin/sh\nprintf 'READY:%s\\n' \"$MCP_TEST_TOKEN\"\nIFS= read -r line\nprintf 'ECHO:%s\\n' \"$line\"\n",
+            [
+                "#!/usr/bin/env python3",
+                "import os, sys",
+                "print(f\"READY:{os.environ.get('MCP_TEST_TOKEN', '')}\")",
+                "sys.stdout.flush()",
+                "line = sys.stdin.readline()",
+                "if line:",
+                "    print(f\"ECHO:{line.rstrip()}\\n\", end='')",
+            ]
+            .join("\n"),
         )
         .expect("write script");
-        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("chmod");
+        make_executable(&script_path);
         script_path
     }
 
@@ -1498,9 +1524,7 @@ mod tests {
         ]
         .join("\n");
         fs::write(&script_path, script).expect("write script");
-        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("chmod");
+        make_executable(&script_path);
         script_path
     }
 
@@ -1632,9 +1656,7 @@ mod tests {
         ]
         .join("\n");
         fs::write(&script_path, script).expect("write script");
-        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("chmod");
+        make_executable(&script_path);
         script_path
     }
 
@@ -1757,9 +1779,7 @@ mod tests {
         ]
         .join("\n");
         fs::write(&script_path, script).expect("write script");
-        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("chmod");
+        make_executable(&script_path);
         script_path
     }
 
@@ -1767,7 +1787,7 @@ mod tests {
         let config = ScopedMcpServerConfig {
             scope: ConfigSource::Local,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
-                command: "/bin/sh".to_string(),
+                command: python_command().to_string(),
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env: BTreeMap::from([("MCP_TEST_TOKEN".to_string(), "secret-value".to_string())]),
                 tool_call_timeout_ms: None,
@@ -1785,7 +1805,7 @@ mod tests {
         env: BTreeMap<String, String>,
     ) -> crate::mcp_client::McpStdioTransport {
         crate::mcp_client::McpStdioTransport {
-            command: "python3".to_string(),
+            command: python_command().to_string(),
             args: vec![script_path.to_string_lossy().into_owned()],
             env,
             tool_call_timeout_ms: None,
@@ -1834,7 +1854,7 @@ mod tests {
         ScopedMcpServerConfig {
             scope: ConfigSource::Local,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
-                command: "python3".to_string(),
+                command: python_command().to_string(),
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env,
                 tool_call_timeout_ms: None,
@@ -1854,7 +1874,7 @@ mod tests {
             let mut process = spawn_mcp_stdio_process(&bootstrap).expect("spawn stdio process");
 
             let ready = process.read_line().await.expect("read ready");
-            assert_eq!(ready, "READY:secret-value\n");
+            assert_eq!(ready.trim_end(), "READY:secret-value");
 
             process
                 .write_line("ping from client")
@@ -1862,7 +1882,7 @@ mod tests {
                 .expect("write line");
 
             let echoed = process.read_line().await.expect("read echo");
-            assert_eq!(echoed, "ECHO:ping from client\n");
+            assert_eq!(echoed.trim_end(), "ECHO:ping from client");
 
             let status = process.wait().await.expect("wait for exit");
             assert!(status.success());
@@ -2053,14 +2073,17 @@ mod tests {
         runtime.block_on(async {
             let script_path = write_echo_script();
             let transport = crate::mcp_client::McpStdioTransport {
-                command: "/bin/sh".to_string(),
+                command: python_command().to_string(),
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env: BTreeMap::from([("MCP_TEST_TOKEN".to_string(), "direct-secret".to_string())]),
                 tool_call_timeout_ms: None,
             };
             let mut process = McpStdioProcess::spawn(&transport).expect("spawn transport directly");
             let ready = process.read_available().await.expect("read ready");
-            assert_eq!(String::from_utf8_lossy(&ready), "READY:direct-secret\n");
+            assert_eq!(
+                String::from_utf8_lossy(&ready).trim_end(),
+                "READY:direct-secret"
+            );
             process.terminate().await.expect("terminate child");
             let _ = process.wait().await.expect("wait after kill");
 
@@ -2312,7 +2335,7 @@ mod tests {
                 ScopedMcpServerConfig {
                     scope: ConfigSource::Local,
                     config: McpServerConfig::Stdio(McpStdioServerConfig {
-                        command: "python3".to_string(),
+                        command: python_command().to_string(),
                         args: vec![script_path.to_string_lossy().into_owned()],
                         env: BTreeMap::from([(
                             "MCP_TOOL_CALL_DELAY_MS".to_string(),
@@ -2365,7 +2388,7 @@ mod tests {
                 ScopedMcpServerConfig {
                     scope: ConfigSource::Local,
                     config: McpServerConfig::Stdio(McpStdioServerConfig {
-                        command: "python3".to_string(),
+                        command: python_command().to_string(),
                         args: vec![script_path.to_string_lossy().into_owned()],
                         env: BTreeMap::from([(
                             "MCP_INVALID_TOOL_CALL_RESPONSE".to_string(),
@@ -2676,9 +2699,7 @@ mod tests {
         ]
         .join("\n");
         fs::write(&script_path, script).expect("write script");
-        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("chmod");
+        make_executable(&script_path);
         script_path
     }
 
@@ -2703,8 +2724,8 @@ mod tests {
                     ScopedMcpServerConfig {
                         scope: ConfigSource::Local,
                         config: McpServerConfig::Stdio(McpStdioServerConfig {
-                            command: broken_script_path.display().to_string(),
-                            args: Vec::new(),
+                            command: python_command().to_string(),
+                            args: vec![broken_script_path.display().to_string()],
                             env: BTreeMap::new(),
                             tool_call_timeout_ms: None,
                         }),
