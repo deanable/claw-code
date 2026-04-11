@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -83,7 +84,7 @@ impl OpenAiCompatConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct OpenAiCompatClient {
     http: reqwest::Client,
     api_key: String,
@@ -92,6 +93,26 @@ pub struct OpenAiCompatClient {
     max_retries: u32,
     initial_backoff: Duration,
     max_backoff: Duration,
+    respect_rate_limits: bool,
+    request_count: AtomicU64,
+    window_start: Mutex<SystemTime>,
+}
+
+impl Clone for OpenAiCompatClient {
+    fn clone(&self) -> Self {
+        Self {
+            http: self.http.clone(),
+            api_key: self.api_key.clone(),
+            config: self.config,
+            base_url: self.base_url.clone(),
+            max_retries: self.max_retries,
+            initial_backoff: self.initial_backoff,
+            max_backoff: self.max_backoff,
+            respect_rate_limits: self.respect_rate_limits,
+            request_count: AtomicU64::new(0),
+            window_start: Mutex::new(SystemTime::now()),
+        }
+    }
 }
 
 impl OpenAiCompatClient {
@@ -113,6 +134,11 @@ impl OpenAiCompatClient {
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
+            respect_rate_limits: std::env::var("CLAW_RESPECT_RATE_LIMITS")
+                .map(|v| v == "true")
+                .unwrap_or(true),
+            request_count: AtomicU64::new(0),
+            window_start: Mutex::new(SystemTime::now()),
         }
     }
 
@@ -124,6 +150,12 @@ impl OpenAiCompatClient {
             ));
         };
         Ok(Self::new(api_key, config))
+    }
+
+    #[must_use]
+    pub fn with_respect_rate_limits(mut self, respect: bool) -> Self {
+        self.respect_rate_limits = respect;
+        self
     }
 
     #[must_use]
@@ -225,13 +257,21 @@ impl OpenAiCompatClient {
         &self,
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
+        if self.respect_rate_limits {
+            self.wait_for_rate_limit().await;
+        }
         let mut attempts = 0;
 
         let last_error = loop {
             attempts += 1;
             let retryable_error = match self.send_raw_request(request).await {
                 Ok(response) => match expect_success(response).await {
-                    Ok(response) => return Ok(response),
+                    Ok(response) => {
+                        if self.respect_rate_limits {
+                            self.record_request();
+                        }
+                        return Ok(response);
+                    }
                     Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => error,
                     Err(error) => return Err(error),
                 },
@@ -250,6 +290,38 @@ impl OpenAiCompatClient {
             attempts,
             last_error: Box::new(last_error),
         })
+    }
+
+    async fn wait_for_rate_limit(&self) {
+        const MAX_REQUESTS_PER_MINUTE: u64 = 30;
+        const WINDOW_SECS: u64 = 60;
+
+        loop {
+            let now = SystemTime::now();
+            let (elapsed, _count) = {
+                let mut window = self.window_start.lock().unwrap();
+                let elapsed = now.duration_since(*window).map(|d| d.as_secs()).unwrap_or(WINDOW_SECS + 1);
+
+                if elapsed >= WINDOW_SECS {
+                    *window = now;
+                    self.request_count.store(0, Ordering::SeqCst);
+                    return;
+                }
+
+                let count = self.request_count.load(Ordering::SeqCst);
+                if count < MAX_REQUESTS_PER_MINUTE {
+                    return;
+                }
+                (elapsed, count)
+            };
+
+            let wait_time = WINDOW_SECS - elapsed;
+            tokio::time::sleep(Duration::from_secs(wait_time)).await;
+        }
+    }
+
+    fn record_request(&self) {
+        self.request_count.fetch_add(1, Ordering::SeqCst);
     }
 
     async fn send_raw_request(

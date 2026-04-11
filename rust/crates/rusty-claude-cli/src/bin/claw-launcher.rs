@@ -27,25 +27,17 @@ const LAUNCH_PROFILE_FILE_NAME: &str = ".claw-launch.json";
 #[serde(rename_all = "camelCase")]
 enum ProviderKind {
     Groq,
-    OpenAi,
     OpenRouter,
-    DashScope,
-    Xai,
-    Anthropic,
-    Ollama,
+    GoogleAiStudio,
     Custom,
 }
 
 impl ProviderKind {
-    fn all() -> [Self; 8] {
+    fn all() -> [Self; 4] {
         [
             Self::Groq,
-            Self::OpenAi,
             Self::OpenRouter,
-            Self::DashScope,
-            Self::Xai,
-            Self::Anthropic,
-            Self::Ollama,
+            Self::GoogleAiStudio,
             Self::Custom,
         ]
     }
@@ -53,33 +45,25 @@ impl ProviderKind {
     fn label(self) -> &'static str {
         match self {
             Self::Groq => "Groq",
-            Self::OpenAi => "OpenAI",
             Self::OpenRouter => "OpenRouter",
-            Self::DashScope => "DashScope",
-            Self::Xai => "xAI",
-            Self::Anthropic => "Anthropic",
-            Self::Ollama => "Ollama",
+            Self::GoogleAiStudio => "Google AI Studio",
             Self::Custom => "Custom",
         }
     }
 
     fn supports_remote_models(self) -> bool {
-        !matches!(self, Self::Anthropic)
+        true
     }
 
     fn requires_api_key(self) -> bool {
-        !matches!(self, Self::Ollama)
+        true
     }
 
     fn api_key_url(self) -> &'static str {
         match self {
             Self::Groq => "https://console.groq.com/keys",
-            Self::OpenAi => "https://platform.openai.com/api-keys",
             Self::OpenRouter => "https://openrouter.ai/keys",
-            Self::DashScope => "https://dashscope.console.aliyun.com/apiKey",
-            Self::Xai => "https://console.x.ai",
-            Self::Anthropic => "https://console.anthropic.com/settings/keys",
-            Self::Ollama => "https://ollama.com/download",
+            Self::GoogleAiStudio => "https://aistudio.google.com/app/apikey",
             Self::Custom => "https://platform.openai.com/api-keys",
         }
     }
@@ -99,6 +83,7 @@ struct ProviderProfile {
     keep_open: bool,
     prompt: String,
     args: Vec<String>,
+    respect_rate_limits: bool,
 }
 
 impl ProviderProfile {
@@ -115,6 +100,7 @@ impl ProviderProfile {
             keep_open: true,
             prompt: String::new(),
             args: Vec::new(),
+            respect_rate_limits: true,
         }
     }
 }
@@ -201,6 +187,7 @@ struct LaunchProfileFile {
     workspace: PathBuf,
     context_window_tokens: u32,
     max_output_tokens: u32,
+    respect_rate_limits: bool,
 }
 
 struct LauncherApp {
@@ -726,6 +713,17 @@ impl eframe::App for LauncherApp {
                     ui.label("Base URL");
                     ui.add(TextEdit::singleline(&mut self.draft.base_url).desired_width(420.0));
                 });
+
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.draft.respect_rate_limits, "Respect rate limits");
+                    if ui.button("Clear credentials").clicked() {
+                        self.draft.api_key.clear();
+                        self.status = "Cleared API key.".to_string();
+                    }
+                    if ui.button("Fetch rate limits").clicked() {
+                        self.status = "Fetching rate limits...".to_string();
+                    }
+                });
             });
 
             ui.add_space(8.0);
@@ -935,7 +933,7 @@ fn default_workspace() -> PathBuf {
     PathBuf::from(r"C:\Users\Dean\source\repos\Premiere Project builder")
 }
 
-fn provider_presets() -> [ProviderPreset; 7] {
+fn provider_presets() -> [ProviderPreset; 4] {
     [
         ProviderPreset {
             kind: ProviderKind::Groq,
@@ -944,40 +942,22 @@ fn provider_presets() -> [ProviderPreset; 7] {
             model: "llama-3.3-70b-versatile",
         },
         ProviderPreset {
-            kind: ProviderKind::OpenAi,
-            name: "OpenAI",
-            base_url: "https://api.openai.com/v1",
-            model: "gpt-4.1-mini",
-        },
-        ProviderPreset {
             kind: ProviderKind::OpenRouter,
             name: "OpenRouter",
             base_url: "https://openrouter.ai/api/v1",
             model: "openai/gpt-oss-120b",
         },
         ProviderPreset {
-            kind: ProviderKind::DashScope,
-            name: "DashScope",
-            base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-            model: "qwen/qwen3-32b",
+            kind: ProviderKind::GoogleAiStudio,
+            name: "Google AI Studio",
+            base_url: "https://generativelanguage.googleapis.com/v1",
+            model: "gemini-2.0-flash",
         },
         ProviderPreset {
-            kind: ProviderKind::Xai,
-            name: "xAI",
-            base_url: "https://api.x.ai/v1",
-            model: "grok-3-mini",
-        },
-        ProviderPreset {
-            kind: ProviderKind::Anthropic,
-            name: "Anthropic",
-            base_url: "https://api.anthropic.com",
-            model: "claude-sonnet-4-5",
-        },
-        ProviderPreset {
-            kind: ProviderKind::Ollama,
-            name: "Ollama",
-            base_url: "http://localhost:11434/v1",
-            model: "openai/gpt-oss-20b",
+            kind: ProviderKind::Custom,
+            name: "Custom",
+            base_url: "",
+            model: "",
         },
     ]
 }
@@ -1009,6 +989,7 @@ fn load_launcher_state(legacy_config_path: &Path) -> (LauncherState, String) {
             keep_open: legacy.keep_open,
             prompt: legacy.prompt.unwrap_or_default(),
             args: legacy.args,
+            respect_rate_limits: true,
         };
         return (
             LauncherState {
@@ -1055,6 +1036,7 @@ fn write_launch_profile(profile: &ProviderProfile, token_limit: (u32, u32)) -> R
         workspace: profile.workspace.clone(),
         context_window_tokens: token_limit.0,
         max_output_tokens: token_limit.1,
+        respect_rate_limits: profile.respect_rate_limits,
     };
     let body = serde_json::to_string_pretty(&launch_profile)
         .map_err(|error| format!("failed to serialize launch profile: {error}"))?;
@@ -1100,32 +1082,23 @@ fn can_find_runtime_dll(name: &str) -> bool {
 }
 
 fn launch_env_vars(profile: &ProviderProfile) -> Vec<(&'static str, String)> {
-    let mut envs = vec![
+    vec![
         ("CLAW_MODEL", profile.model.clone()),
         ("CLAW_PROVIDER_NAME", profile.friendly_name.clone()),
-    ];
-    match profile.provider_kind {
-        ProviderKind::Anthropic => {
-            envs.push(("ANTHROPIC_API_KEY", profile.api_key.clone()));
-            envs.push(("ANTHROPIC_BASE_URL", profile.base_url.clone()));
-        }
-        _ => {
-            envs.push(("OPENAI_API_KEY", profile.api_key.clone()));
-            envs.push(("OPENAI_BASE_URL", profile.base_url.clone()));
-        }
-    }
-    envs
+        (
+            "CLAW_RESPECT_RATE_LIMITS",
+            profile.respect_rate_limits.to_string(),
+        ),
+        ("OPENAI_API_KEY", profile.api_key.clone()),
+        ("OPENAI_BASE_URL", profile.base_url.clone()),
+    ]
 }
 
 fn provider_default_token_limit(provider_kind: ProviderKind) -> (u32, u32) {
     match provider_kind {
         ProviderKind::Groq => (131_072, 8_192),
-        ProviderKind::OpenAi => (128_000, 16_384),
         ProviderKind::OpenRouter => (131_072, 16_384),
-        ProviderKind::DashScope => (131_072, 16_384),
-        ProviderKind::Xai => (131_072, 16_384),
-        ProviderKind::Anthropic => (200_000, 64_000),
-        ProviderKind::Ollama => (131_072, 16_384),
+        ProviderKind::GoogleAiStudio => (131_072, 16_384),
         ProviderKind::Custom => (131_072, 16_384),
     }
 }
@@ -1339,12 +1312,8 @@ fn model_matches_provider(model_id: &str, provider_kind: ProviderKind) -> bool {
                 | "groq/compound"
                 | "qwen/qwen3-32b"
         ),
-        ProviderKind::OpenAi => matches!(model_id, "gpt-4.1-mini" | "gpt-4.1"),
         ProviderKind::OpenRouter => true,
-        ProviderKind::DashScope => matches!(model_id, "qwen/qwen3-32b"),
-        ProviderKind::Xai => matches!(model_id, "grok-3-mini"),
-        ProviderKind::Anthropic => matches!(model_id, "claude-sonnet-4-5"),
-        ProviderKind::Ollama => matches!(model_id, "openai/gpt-oss-20b" | "openai/gpt-oss-120b"),
+        ProviderKind::GoogleAiStudio => true,
         ProviderKind::Custom => true,
     }
 }
