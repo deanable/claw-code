@@ -54,13 +54,26 @@ jobs:
           $readme = Join-Path $package "README.txt"
           $installerReadme = Join-Path "..\installer" "README.txt"
 
-          Copy-Item "target\release\claw.exe" $claw -Force
-          Copy-Item "target\release\claw-launcher.exe" $launcher -Force
-          Copy-Item $installerReadme $readme -Force
-          Copy-Item "..\rust\.claw" $package -Recurse -Force
-          Copy-Item $claw (Join-Path $package (Split-Path $claw -Leaf)) -Force
-          Copy-Item $launcher (Join-Path $package (Split-Path $launcher -Leaf)) -Force
-          Copy-Item "..\installer\claw.iss" (Join-Path $dist "claw.iss") -Force
+          Write-Host "Copying claw.exe from target\release\claw.exe"
+          Copy-Item "target\release\claw.exe" $claw -Force -Verbose
+          Write-Host "Copying claw-launcher.exe from target\release\claw-launcher.exe"
+          Copy-Item "target\release\claw-launcher.exe" $launcher -Force -Verbose
+          Write-Host "Copying README.txt"
+          Copy-Item $installerReadme $readme -Force -Verbose
+          Write-Host "Copying .claw folder"
+          Copy-Item "..\rust\.claw" $package -Recurse -Force -Verbose
+          
+          Write-Host "Copying to package folder:"
+          Copy-Item $claw (Join-Path $package (Split-Path $claw -Leaf)) -Force -Verbose
+          Copy-Item $launcher (Join-Path $package (Split-Path $launcher -Leaf)) -Force -Verbose
+          
+          Write-Host "Copying installer script"
+          Copy-Item "..\installer\claw.iss" (Join-Path $dist "claw.iss") -Force -Verbose
+          
+          Write-Host "`n=== Contents of dist folder ==="
+          Get-ChildItem -Recurse $dist | ForEach-Object { Write-Host $_.FullName }
+          Write-Host "`n=== Contents of package folder ==="
+          Get-ChildItem -Recurse $package | ForEach-Object { Write-Host $_.FullName }
 
       - name: Build Windows installer
         shell: pwsh
@@ -71,6 +84,12 @@ jobs:
           $package = Join-Path $dist "installer-root"
           $iscc = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) "Inno Setup 6\ISCC.exe"
 
+          Write-Host "Running ISCC with:"
+          Write-Host "  AppVersion: $version"
+          Write-Host "  SourceRoot: $package"
+          Write-Host "  OutputDir: $dist"
+          Write-Host "  Script: dist\claw.iss"
+          
           & $iscc "/DAppVersion=$version" "/DSourceRoot=$package" "/DOutputDir=$dist" "dist\claw.iss"
 
       - name: Upload workflow artifact
