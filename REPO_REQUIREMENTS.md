@@ -10,6 +10,11 @@ This document captures the working rules for future changes in this repository.
 - The installer should include `claw.exe`, `claw-launcher.exe`, the required `.claw` payload, and the user-facing `README.txt`.
 - The installer should create a desktop shortcut to `claw-launcher.exe`.
 - The installer should prefer a per-user install location so the launcher can write its state without requiring elevation.
+- The installer metadata should identify Dean Kruger as the publisher.
+- If Windows still shows an unknown publisher warning, the fix is code signing, not more packaging metadata.
+- Internal signing can use a self-signed code-signing certificate generated from PowerShell.
+- Self-signed certificates only help on machines that trust the certificate chain.
+- The release workflow should sign the built binaries and installer when signing secrets are provided.
 - Keep the release workflow tied to version tags pushed to `main`.
 - Do not add back macOS or Linux release jobs unless explicitly requested.
 - GitHub will still expose auto-generated source archives for tags; the workflow itself should not upload source bundles.
