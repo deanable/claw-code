@@ -2,12 +2,13 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::error::ApiError;
 use crate::types::{MessageRequest, MessageResponse};
 
 pub mod anthropic;
+pub mod google_ai_studio;
 pub mod openai_compat;
 
 #[allow(dead_code)]
@@ -31,6 +32,7 @@ pub trait Provider {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     Anthropic,
+    GoogleAiStudio,
     Xai,
     OpenAi,
 }
@@ -47,14 +49,6 @@ pub struct ProviderMetadata {
 pub struct ModelTokenLimit {
     pub max_output_tokens: u32,
     pub context_window_tokens: u32,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LaunchProfileOverride {
-    model: String,
-    context_window_tokens: u32,
-    max_output_tokens: u32,
 }
 
 const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
@@ -153,6 +147,7 @@ pub fn resolve_model_alias(model: &str) -> String {
                     _ => trimmed,
                 },
                 ProviderKind::OpenAi => trimmed,
+                ProviderKind::GoogleAiStudio => trimmed,
             })
         })
         .map_or_else(|| trimmed.to_string(), ToOwned::to_owned)
@@ -177,14 +172,19 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
         });
     }
+    if canonical.starts_with("gemini-") || canonical.starts_with("google/") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::GoogleAiStudio,
+            auth_env: "GOOGLE_API_KEY",
+            base_url_env: "GOOGLE_BASE_URL",
+            default_base_url: google_ai_studio::DEFAULT_GOOGLE_BASE_URL,
+        });
+    }
     // Explicit provider-namespaced models (e.g. "openai/gpt-4.1-mini") must
     // route to the correct provider regardless of which auth env vars are set.
     // Without this, detect_provider_kind falls through to the auth-sniffer
     // order and misroutes to Anthropic if ANTHROPIC_API_KEY is present.
-    if canonical.starts_with("openai/")
-        || canonical.starts_with("groq/")
-        || canonical.starts_with("gpt-")
-    {
+    if canonical.starts_with("openai/") || canonical.starts_with("gpt-") {
         return Some(ProviderMetadata {
             provider: ProviderKind::OpenAi,
             auth_env: "OPENAI_API_KEY",
@@ -213,8 +213,20 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     if let Some(metadata) = metadata_for_model(model) {
         return metadata.provider;
     }
+    // When OPENAI_BASE_URL is set, the user explicitly configured an
+    // OpenAI-compatible endpoint. Prefer it over the Anthropic fallback
+    // even when the model name has no recognized prefix — this is the
+    // common case for local providers (Ollama, LM Studio, vLLM, etc.)
+    // where model names like "qwen2.5-coder:7b" don't match any prefix.
+    if std::env::var_os("OPENAI_BASE_URL").is_some() && openai_compat::has_api_key("OPENAI_API_KEY")
+    {
+        return ProviderKind::OpenAi;
+    }
     if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
         return ProviderKind::Anthropic;
+    }
+    if google_ai_studio::has_api_key("GOOGLE_API_KEY") {
+        return ProviderKind::GoogleAiStudio;
     }
     if openai_compat::has_api_key("OPENAI_API_KEY") {
         return ProviderKind::OpenAi;
@@ -222,14 +234,16 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     if openai_compat::has_api_key("XAI_API_KEY") {
         return ProviderKind::Xai;
     }
+    // Last resort: if OPENAI_BASE_URL is set without OPENAI_API_KEY (some
+    // local providers like Ollama don't require auth), still route there.
+    if std::env::var_os("OPENAI_BASE_URL").is_some() {
+        return ProviderKind::OpenAi;
+    }
     ProviderKind::Anthropic
 }
 
 #[must_use]
 pub fn max_tokens_for_model(model: &str) -> u32 {
-    if let Some(limit) = launcher_model_token_limit(model) {
-        return limit.max_output_tokens;
-    }
     model_token_limit(model).map_or_else(
         || {
             let canonical = resolve_model_alias(model);
@@ -253,9 +267,6 @@ pub fn max_tokens_for_model_with_override(model: &str, plugin_override: Option<u
 
 #[must_use]
 pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
-    if let Some(limit) = launcher_model_token_limit(model) {
-        return Some(limit);
-    }
     let canonical = resolve_model_alias(model);
     match canonical.as_str() {
         "claude-opus-4-6" => Some(ModelTokenLimit {
@@ -282,21 +293,12 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 8_192,
             context_window_tokens: 131_072,
         }),
+        "gemini-2.0-flash" | "gemini-2.0-flash-lite" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 1_048_576,
+        }),
         _ => None,
     }
-}
-
-fn launcher_model_token_limit(model: &str) -> Option<ModelTokenLimit> {
-    let cwd = std::env::current_dir().ok()?;
-    let path = cwd.join(".claw-launch.json");
-    let body = std::fs::read_to_string(path).ok()?;
-    let launch_profile = serde_json::from_str::<LaunchProfileOverride>(&body).ok()?;
-    let requested = resolve_model_alias(model);
-    let recorded = resolve_model_alias(&launch_profile.model);
-    (requested == recorded).then_some(ModelTokenLimit {
-        max_output_tokens: launch_profile.max_output_tokens,
-        context_window_tokens: launch_profile.context_window_tokens,
-    })
 }
 
 pub fn preflight_message_request(request: &MessageRequest) -> Result<(), ApiError> {
@@ -338,6 +340,11 @@ fn estimate_serialized_tokens<T: Serialize>(value: &T) -> u32 {
 /// credentials probably belong to a different provider and suggest the
 /// model-prefix routing fix that would select it.
 const FOREIGN_PROVIDER_ENV_VARS: &[(&str, &str, &str)] = &[
+    (
+        "GOOGLE_API_KEY",
+        "Google AI Studio",
+        "use a Gemini model name (for example `--model gemini-2.0-flash`) so provider routing selects the native Google backend, and set `GOOGLE_BASE_URL` only if you need a non-default Gemini API endpoint",
+    ),
     (
         "OPENAI_API_KEY",
         "OpenAI-compat",
@@ -536,9 +543,10 @@ mod tests {
         // ANTHROPIC_API_KEY was set because metadata_for_model returned None
         // and detect_provider_kind fell through to auth-sniffer order.
         // The model prefix must win over env-var presence.
-        let kind = super::metadata_for_model("openai/gpt-4.1-mini")
-            .map(|m| m.provider)
-            .unwrap_or_else(|| detect_provider_kind("openai/gpt-4.1-mini"));
+        let kind = super::metadata_for_model("openai/gpt-4.1-mini").map_or_else(
+            || detect_provider_kind("openai/gpt-4.1-mini"),
+            |m| m.provider,
+        );
         assert_eq!(
             kind,
             ProviderKind::OpenAi,
@@ -547,21 +555,8 @@ mod tests {
 
         // Also cover bare gpt- prefix
         let kind2 = super::metadata_for_model("gpt-4o")
-            .map(|m| m.provider)
-            .unwrap_or_else(|| detect_provider_kind("gpt-4o"));
+            .map_or_else(|| detect_provider_kind("gpt-4o"), |m| m.provider);
         assert_eq!(kind2, ProviderKind::OpenAi);
-    }
-
-    #[test]
-    fn groq_namespaced_model_routes_to_openai_compat_not_anthropic() {
-        let kind = super::metadata_for_model("groq/compound")
-            .map(|m| m.provider)
-            .unwrap_or_else(|| detect_provider_kind("groq/compound"));
-        assert_eq!(
-            kind,
-            ProviderKind::OpenAi,
-            "groq/ prefix must route to the OpenAI-compatible provider"
-        );
     }
 
     #[test]
@@ -598,9 +593,6 @@ mod tests {
     fn keeps_existing_max_token_heuristic() {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
-        assert_eq!(max_tokens_for_model("openai/gpt-oss-120b"), 4_096);
-        assert_eq!(max_tokens_for_model("llama-3.3-70b-versatile"), 4_096);
-        assert_eq!(max_tokens_for_model("groq/compound"), 8_192);
     }
 
     #[test]
@@ -664,24 +656,6 @@ mod tests {
         assert_eq!(
             model_token_limit("grok-mini")
                 .expect("grok-mini should resolve to a registered model")
-                .context_window_tokens,
-            131_072
-        );
-        assert_eq!(
-            model_token_limit("groq/compound")
-                .expect("groq/compound should be registered")
-                .max_output_tokens,
-            8_192
-        );
-        assert_eq!(
-            model_token_limit("openai/gpt-oss-120b")
-                .expect("openai/gpt-oss-120b should be registered")
-                .max_output_tokens,
-            4_096
-        );
-        assert_eq!(
-            model_token_limit("llama-3.3-70b-versatile")
-                .expect("llama-3.3-70b-versatile should be registered")
                 .context_window_tokens,
             131_072
         );
@@ -1056,4 +1030,31 @@ NO_EQUALS_LINE
             "empty env var should not trigger the hint sniffer, got {hint:?}"
         );
     }
+
+    #[test]
+    fn openai_base_url_overrides_anthropic_fallback_for_unknown_model() {
+        // given — user has OPENAI_BASE_URL + OPENAI_API_KEY but no Anthropic
+        // creds, and a model name with no recognized prefix.
+        let _lock = env_lock();
+        let _base_url = EnvVarGuard::set("OPENAI_BASE_URL", Some("http://127.0.0.1:11434/v1"));
+        let _api_key = EnvVarGuard::set("OPENAI_API_KEY", Some("dummy"));
+        let _anthropic_key = EnvVarGuard::set("ANTHROPIC_API_KEY", None);
+        let _anthropic_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
+
+        // when
+        let provider = detect_provider_kind("qwen2.5-coder:7b");
+
+        // then — should route to OpenAI, not Anthropic
+        assert_eq!(
+            provider,
+            ProviderKind::OpenAi,
+            "OPENAI_BASE_URL should win over Anthropic fallback for unknown models"
+        );
+    }
+
+    // NOTE: a "OPENAI_BASE_URL without OPENAI_API_KEY" test is omitted
+    // because workspace-parallel test binaries can race on process env
+    // (env_lock only protects within a single binary). The detection logic
+    // is covered: OPENAI_BASE_URL alone routes to OpenAi as a last-resort
+    // fallback in detect_provider_kind().
 }

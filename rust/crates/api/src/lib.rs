@@ -7,8 +7,9 @@ mod sse;
 mod types;
 
 pub use client::{
-    oauth_token_is_expired, read_base_url, read_xai_base_url, resolve_saved_oauth_token,
-    resolve_startup_auth_source, MessageStream, OAuthTokenSet, ProviderClient,
+    oauth_token_is_expired, read_base_url, read_google_base_url, read_xai_base_url,
+    resolve_saved_oauth_token, resolve_startup_auth_source, MessageStream, OAuthTokenSet,
+    ProviderClient,
 };
 pub use error::ApiError;
 pub use http_client::{
@@ -19,6 +20,7 @@ pub use prompt_cache::{
     PromptCacheStats,
 };
 pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
+pub use providers::google_ai_studio::{GoogleAiStudioClient, GoogleAiStudioConfig};
 pub use providers::openai_compat::{OpenAiCompatClient, OpenAiCompatConfig};
 pub use providers::{
     detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,

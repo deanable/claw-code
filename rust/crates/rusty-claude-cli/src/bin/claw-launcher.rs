@@ -2,9 +2,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{self, Color32, IconData, RichText, TextEdit};
 use reqwest::blocking::Client;
@@ -19,9 +22,11 @@ const SYSTEM_PROMPT_ESTIMATE: u32 = 2_500;
 const BASE_REQUEST_OVERHEAD: u32 = 1_500;
 const REGISTRY_PATH: &str = "Software\\ClawLauncher";
 const REGISTRY_STATE_VALUE: &str = "LauncherState";
+const LAUNCH_PROMPT_ENV_VAR: &str = "CLAW_LAUNCH_PROMPT";
 const LEGACY_DEFAULT_MODEL: &str = "llama-3.3-70b-versatile";
 const NEW_PROVIDER_KEY: &str = "__new_provider__";
 const LAUNCH_PROFILE_FILE_NAME: &str = ".claw-launch.json";
+const LAUNCHER_LOG_FILE_NAME: &str = "claw-launcher.log";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,7 +57,7 @@ impl ProviderKind {
     }
 
     fn supports_remote_models(self) -> bool {
-        true
+        !matches!(self, Self::GoogleAiStudio)
     }
 
     fn requires_api_key(self) -> bool {
@@ -180,14 +185,38 @@ struct OpenAiCompatModel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LaunchProfileFile {
-    provider_name: String,
-    provider_kind: ProviderKind,
-    model: String,
-    base_url: String,
-    workspace: PathBuf,
-    context_window_tokens: u32,
-    max_output_tokens: u32,
-    respect_rate_limits: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_kind: Option<ProviderKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    allowed_tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    keep_open: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    args: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_window_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    respect_rate_limits: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profiles: Option<Vec<ProviderProfile>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_selected: Option<String>,
 }
 
 struct LauncherApp {
@@ -224,6 +253,12 @@ impl LauncherApp {
         let legacy_config_path = exe_dir.join("claw-launcher.json");
         let claw_path = exe_dir.join("claw.exe");
         let (state, status) = load_launcher_state(&legacy_config_path);
+        log_launcher_event(format!(
+            "startup exe_dir='{}' claw_path='{}' status='{}'",
+            exe_dir.display(),
+            claw_path.display(),
+            status
+        ));
         let selected_provider = state
             .last_selected
             .clone()
@@ -256,6 +291,7 @@ impl LauncherApp {
         app.load_selected_provider();
         if !app.claw_path.is_file() {
             app.status = format!("Missing {} next to the launcher.", app.claw_path.display());
+            log_launcher_event(app.status.clone());
         }
         app
     }
@@ -272,6 +308,13 @@ impl LauncherApp {
             .current_profile_index()
             .map(|index| self.state.profiles[index].clone())
             .unwrap_or_default();
+        log_launcher_event(format!(
+            "load_selected_provider selected='{}' resolved='{}' model='{}' workspace='{}'",
+            self.selected_provider,
+            profile.friendly_name,
+            profile.model,
+            profile.workspace.display()
+        ));
         self.set_editor_profile(profile);
         self.refresh_models_with_status(false);
     }
@@ -385,7 +428,6 @@ impl LauncherApp {
     }
 
     fn apply_model_search(&mut self) {
-        self.model_search_filter = self.draft.model.trim().to_string();
         let matches = self.filtered_models().len();
         self.status = if self.model_search_filter.is_empty() {
             "Showing all known models for this provider.".to_string()
@@ -437,38 +479,27 @@ impl LauncherApp {
         if new_name.is_empty() {
             return Err("Enter a provider name first.".to_string());
         }
-
-        let current_index = self.current_profile_index();
-        let duplicate = self
-            .state
-            .profiles
-            .iter()
-            .enumerate()
-            .any(|(index, profile)| {
-                profile.friendly_name == new_name && Some(index) != current_index
-            });
-        if duplicate {
-            return Err(format!("A provider named '{new_name}' already exists."));
-        }
-
-        self.draft.friendly_name = new_name.to_string();
-        match current_index {
-            Some(index) => self.state.profiles[index] = self.draft.clone(),
-            None => self.state.profiles.push(self.draft.clone()),
-        }
-        self.state
-            .profiles
-            .sort_by(|left, right| left.friendly_name.cmp(&right.friendly_name));
-        self.state.last_selected = Some(self.draft.friendly_name.clone());
-        self.selected_provider = self.draft.friendly_name.clone();
-        save_launcher_state(&self.state)?;
-        if self.draft.workspace.is_dir() {
-            let _ = write_launch_profile(&self.draft, self.selected_token_limit());
-        }
-        self.status = format!(
-            "Saved provider '{}' to HKCU\\{}.",
-            self.draft.friendly_name, REGISTRY_PATH
-        );
+        let overwrote_existing = self.persist_draft_to_registry(true)?;
+        log_launcher_event(format!(
+            "save_provider name='{}' kind='{}' workspace='{}' model='{}' prompt_len={} profiles={}",
+            self.draft.friendly_name,
+            self.draft.provider_kind.label(),
+            self.draft.workspace.display(),
+            self.draft.model,
+            self.draft.prompt.len(),
+            self.state.profiles.len()
+        ));
+        self.status = if overwrote_existing {
+            format!(
+                "Updated provider '{}' in HKCU\\{}.",
+                self.draft.friendly_name, REGISTRY_PATH
+            )
+        } else {
+            format!(
+                "Saved provider '{}' to HKCU\\{}.",
+                self.draft.friendly_name, REGISTRY_PATH
+            )
+        };
         Ok(())
     }
 
@@ -489,6 +520,10 @@ impl LauncherApp {
             self.refresh_models_with_status(false);
         }
         save_launcher_state(&self.state)?;
+        if self.draft.workspace.is_dir() {
+            let _ =
+                write_launch_profile(&self.draft, self.selected_token_limit(), Some(&self.state));
+        }
         self.status = format!("Deleted provider '{removed_name}'.");
         Ok(())
     }
@@ -514,7 +549,14 @@ impl LauncherApp {
         if self.draft.model.trim().is_empty() {
             return Err("Choose a model before launching.".to_string());
         }
-        write_launch_profile(&self.draft, self.selected_token_limit())?;
+        self.persist_draft_to_registry(false)?;
+        let launch_profile = self
+            .state
+            .profiles
+            .iter()
+            .find(|profile| profile.friendly_name == self.selected_provider)
+            .cloned()
+            .unwrap_or_else(|| self.draft.clone());
 
         let user_profile = std::env::var("USERPROFILE")
             .map_err(|_| "USERPROFILE is not set on this machine.".to_string())?;
@@ -522,34 +564,42 @@ impl LauncherApp {
         let mut claw_command = format!(
             "& '{}' --model '{}' --permission-mode '{}'",
             powershell_escape(&self.claw_path.display().to_string()),
-            powershell_escape(&self.draft.model),
-            powershell_escape(&self.draft.permission_mode)
+            powershell_escape(&launch_profile.model),
+            powershell_escape(&launch_profile.permission_mode)
         );
-        if !self.draft.allowed_tools.is_empty() {
+        if !launch_profile.allowed_tools.is_empty() {
             claw_command.push_str(&format!(
                 " --allowedTools '{}'",
-                powershell_escape(&self.draft.allowed_tools.join(","))
+                powershell_escape(&launch_profile.allowed_tools.join(","))
             ));
         }
-        if !self.draft.prompt.trim().is_empty() {
-            claw_command.push_str(&format!(
-                " prompt '{}'",
-                powershell_escape(self.draft.prompt.trim())
-            ));
-        }
-        for arg in &self.draft.args {
+        for arg in &launch_profile.args {
             claw_command.push_str(&format!(" '{}'", powershell_escape(arg)));
         }
 
-        let mut command = Command::new("powershell");
-        command.current_dir(&self.draft.workspace);
+        let powershell_path = resolve_powershell_executable();
+        log_launcher_event(format!(
+            "launch selected='{}' profile='{}' workspace='{}' powershell='{}' claw='{}' model='{}'",
+            self.selected_provider,
+            launch_profile.friendly_name,
+            launch_profile.workspace.display(),
+            powershell_path.display(),
+            self.claw_path.display(),
+            launch_profile.model
+        ));
+
+        let mut command = Command::new(&powershell_path);
+        command.current_dir(&launch_profile.workspace);
         command.arg("-NoLogo");
-        if self.draft.keep_open {
+        if launch_profile.keep_open {
             command.arg("-NoExit");
         }
         command.arg("-Command").arg(claw_command);
+        if !launch_profile.prompt.trim().is_empty() {
+            command.env(LAUNCH_PROMPT_ENV_VAR, launch_profile.prompt.clone());
+        }
         command.env("HOME", user_profile);
-        for (key, value) in launch_env_vars(&self.draft) {
+        for (key, value) in launch_env_vars(&launch_profile) {
             command.env(key, value);
         }
         #[cfg(target_os = "windows")]
@@ -557,12 +607,78 @@ impl LauncherApp {
             use std::os::windows::process::CommandExt;
             command.creation_flags(CREATE_NEW_CONSOLE);
         }
-        command
-            .spawn()
-            .map_err(|error| format!("failed to start {}: {error}", self.claw_path.display()))?;
-        self.status = format!("Launching '{}'...", self.draft.friendly_name);
+        command.spawn().map_err(|error| {
+            let message = format!(
+                "failed to start {} via {}: {}",
+                self.claw_path.display(),
+                powershell_path.display(),
+                error
+            );
+            log_launcher_event(format!("launch_error {}", message));
+            message
+        })?;
+        self.status = if self.draft.prompt.trim().is_empty() {
+            format!(
+                "Launching '{}' in {}...",
+                launch_profile.friendly_name,
+                launch_profile.workspace.display()
+            )
+        } else {
+            format!(
+                "Launching '{}' in {}... the prompt will be sent as the first command.",
+                launch_profile.friendly_name,
+                launch_profile.workspace.display()
+            )
+        };
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         Ok(())
+    }
+
+    fn persist_draft_to_registry(&mut self, require_name: bool) -> Result<bool, String> {
+        let resolved_name = self.draft.friendly_name.trim();
+        if require_name && resolved_name.is_empty() {
+            return Err("Enter a provider name first.".to_string());
+        }
+
+        if resolved_name.is_empty() {
+            let fallback_name = if self.selected_provider != NEW_PROVIDER_KEY
+                && !self.selected_provider.trim().is_empty()
+            {
+                self.selected_provider.trim().to_string()
+            } else {
+                self.draft.provider_kind.label().to_string()
+            };
+            self.draft.friendly_name = fallback_name;
+        } else {
+            self.draft.friendly_name = resolved_name.to_string();
+        }
+
+        let current_index = self.current_profile_index();
+        let existing_index = self
+            .state
+            .profiles
+            .iter()
+            .enumerate()
+            .find_map(|(index, profile)| {
+                (profile.friendly_name == self.draft.friendly_name && Some(index) != current_index)
+                    .then_some(index)
+            });
+
+        let overwrote_existing = current_index.is_some() || existing_index.is_some();
+        match current_index.or(existing_index) {
+            Some(index) => self.state.profiles[index] = self.draft.clone(),
+            None => self.state.profiles.push(self.draft.clone()),
+        }
+        self.state
+            .profiles
+            .sort_by(|left, right| left.friendly_name.cmp(&right.friendly_name));
+        self.state.last_selected = Some(self.draft.friendly_name.clone());
+        self.selected_provider = self.draft.friendly_name.clone();
+        save_launcher_state(&self.state)?;
+        if self.draft.workspace.is_dir() {
+            write_launch_profile(&self.draft, self.selected_token_limit(), Some(&self.state))?;
+        }
+        Ok(overwrote_existing)
     }
 
     fn context_estimate(&self) -> Option<(u32, u32, u32)> {
@@ -781,10 +897,14 @@ impl eframe::App for LauncherApp {
             ui.group(|ui| {
                 ui.heading("Model And Tools");
                 ui.horizontal(|ui| {
-                    ui.label("Model");
-                    let model_response =
-                        ui.add(TextEdit::singleline(&mut self.draft.model).desired_width(280.0));
+                    ui.label("Search");
+                    let search_response = ui.add(
+                        TextEdit::singleline(&mut self.model_search_filter).desired_width(280.0),
+                    );
                     if ui.button("Search").clicked() {
+                        self.apply_model_search();
+                    }
+                    if search_response.changed() {
                         self.apply_model_search();
                     }
                     let filtered_models = self.filtered_models();
@@ -816,9 +936,14 @@ impl eframe::App for LauncherApp {
                         });
                     if let Some(model_id) = newly_selected_model {
                         self.draft.model = model_id;
-                        self.model_search_filter = self.draft.model.clone();
                         self.sanitize_selected_tools();
                     }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Model");
+                    let model_response =
+                        ui.add(TextEdit::singleline(&mut self.draft.model).desired_width(280.0));
                     if model_response.changed() {
                         self.sanitize_selected_tools();
                     }
@@ -914,23 +1039,32 @@ impl eframe::App for LauncherApp {
 }
 
 fn load_launcher_window_icon() -> Arc<IconData> {
-    Arc::new(
-        image::load_from_memory(include_bytes!("../../../../../assets/openclaw.ico"))
-            .map(|image| {
-                let rgba = image.into_rgba8();
-                let (width, height) = rgba.dimensions();
-                IconData {
-                    rgba: rgba.into_raw(),
-                    width,
-                    height,
-                }
-            })
-            .unwrap_or_default(),
-    )
+    let icon_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("..")
+        .join("assets")
+        .join("openclaw.ico");
+    let icon = fs::read(icon_path)
+        .ok()
+        .and_then(|bytes| image::load_from_memory(&bytes).ok())
+        .map(|image| {
+            let rgba = image.into_rgba8();
+            let (width, height) = rgba.dimensions();
+            IconData {
+                rgba: rgba.into_raw(),
+                width,
+                height,
+            }
+        })
+        .unwrap_or_default();
+    Arc::new(icon)
 }
 
 fn default_workspace() -> PathBuf {
-    PathBuf::from(r"C:\Users\Dean\source\repos\Premiere Project builder")
+    std::env::current_dir()
+        .or_else(|_| current_exe_dir())
+        .unwrap_or_else(|_| PathBuf::from("."))
 }
 
 fn provider_presets() -> [ProviderPreset; 4] {
@@ -950,7 +1084,7 @@ fn provider_presets() -> [ProviderPreset; 4] {
         ProviderPreset {
             kind: ProviderKind::GoogleAiStudio,
             name: "Google AI Studio",
-            base_url: "https://generativelanguage.googleapis.com/v1",
+            base_url: "https://generativelanguage.googleapis.com/v1beta",
             model: "gemini-2.0-flash",
         },
         ProviderPreset {
@@ -970,10 +1104,33 @@ fn starter_profiles() -> Vec<ProviderProfile> {
 }
 
 fn load_launcher_state(legacy_config_path: &Path) -> (LauncherState, String) {
-    if let Some(state) = read_registry_state() {
+    let sidecar_path = default_workspace().join(LAUNCH_PROFILE_FILE_NAME);
+    let registry_state = read_registry_state();
+    if let Some(state) = registry_state
+        .clone()
+        .map(|state| hydrate_state_from_sidecar(state, &sidecar_path))
+    {
+        log_launcher_event(format!(
+            "load_launcher_state source=registry path='{}' profiles={} last_selected='{}'",
+            sidecar_path.display(),
+            state.profiles.len(),
+            state.last_selected.clone().unwrap_or_default()
+        ));
         return (
             state,
             "Loaded provider profiles from the registry.".to_string(),
+        );
+    }
+    if let Some(state) = load_state_from_sidecar(&sidecar_path, None) {
+        log_launcher_event(format!(
+            "load_launcher_state source=sidecar path='{}' profiles={} last_selected='{}'",
+            sidecar_path.display(),
+            state.profiles.len(),
+            state.last_selected.clone().unwrap_or_default()
+        ));
+        return (
+            state,
+            format!("Loaded provider profiles from {}.", sidecar_path.display()),
         );
     }
     if let Some(legacy) = load_legacy_config(legacy_config_path) {
@@ -1013,7 +1170,239 @@ fn read_registry_state() -> Option<LauncherState> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let key = hkcu.open_subkey(REGISTRY_PATH).ok()?;
     let body: String = key.get_value(REGISTRY_STATE_VALUE).ok()?;
-    serde_json::from_str(&body).ok()
+    let parsed = serde_json::from_str(&body).ok();
+    log_launcher_event(format!(
+        "read_registry_state success={} bytes={}",
+        parsed.is_some(),
+        body.len()
+    ));
+    parsed
+}
+
+fn load_state_from_sidecar(
+    path: &Path,
+    registry_state: Option<&LauncherState>,
+) -> Option<LauncherState> {
+    let body = fs::read_to_string(path).ok()?;
+    let sidecar = serde_json::from_str::<LaunchProfileFile>(&body).ok()?;
+
+    let merged_profiles = if let Some(profiles) = sidecar.profiles.clone() {
+        profiles
+    } else if let Some(profile) = profile_from_sidecar(&sidecar, registry_state) {
+        vec![profile]
+    } else {
+        registry_state?.profiles.clone()
+    };
+
+    let last_selected = sidecar
+        .last_selected
+        .clone()
+        .or_else(|| sidecar.provider_name.clone())
+        .or_else(|| registry_state.and_then(|state| state.last_selected.clone()))
+        .or_else(|| {
+            merged_profiles
+                .first()
+                .map(|profile| profile.friendly_name.clone())
+        });
+
+    Some(LauncherState {
+        profiles: merge_profiles_with_registry(merged_profiles, registry_state),
+        last_selected,
+    })
+}
+
+fn hydrate_state_from_sidecar(mut state: LauncherState, path: &Path) -> LauncherState {
+    let Ok(body) = fs::read_to_string(path) else {
+        return state;
+    };
+    let Ok(sidecar) = serde_json::from_str::<LaunchProfileFile>(&body) else {
+        return state;
+    };
+
+    if let Some(last_selected) = sidecar
+        .last_selected
+        .clone()
+        .or_else(|| sidecar.provider_name.clone())
+    {
+        if state
+            .profiles
+            .iter()
+            .any(|profile| profile.friendly_name == last_selected)
+        {
+            state.last_selected = Some(last_selected);
+        }
+    }
+
+    if let Some(profile) = profile_from_sidecar(&sidecar, Some(&state)) {
+        if let Some(existing) = state
+            .profiles
+            .iter_mut()
+            .find(|candidate| candidate.friendly_name == profile.friendly_name)
+        {
+            *existing = merge_profile_with_registry_fallback(profile, existing.clone());
+        } else {
+            state.profiles.push(profile);
+            state
+                .profiles
+                .sort_by(|left, right| left.friendly_name.cmp(&right.friendly_name));
+        }
+    }
+
+    state
+}
+
+fn profile_from_sidecar(
+    sidecar: &LaunchProfileFile,
+    registry_state: Option<&LauncherState>,
+) -> Option<ProviderProfile> {
+    let name = sidecar
+        .provider_name
+        .clone()
+        .or_else(|| registry_state.and_then(|state| state.last_selected.clone()))?;
+    let fallback = registry_state.and_then(|state| {
+        state
+            .profiles
+            .iter()
+            .find(|profile| profile.friendly_name == name)
+            .cloned()
+    });
+    Some(ProviderProfile {
+        friendly_name: name,
+        provider_kind: sidecar
+            .provider_kind
+            .or_else(|| fallback.as_ref().map(|profile| profile.provider_kind))
+            .unwrap_or(ProviderKind::Custom),
+        api_key: sidecar
+            .api_key
+            .clone()
+            .or_else(|| fallback.as_ref().map(|profile| profile.api_key.clone()))
+            .unwrap_or_default(),
+        base_url: sidecar
+            .base_url
+            .clone()
+            .or_else(|| fallback.as_ref().map(|profile| profile.base_url.clone()))
+            .unwrap_or_default(),
+        workspace: sidecar
+            .workspace
+            .clone()
+            .or_else(|| fallback.as_ref().map(|profile| profile.workspace.clone()))
+            .unwrap_or_else(default_workspace),
+        model: sidecar
+            .model
+            .clone()
+            .or_else(|| fallback.as_ref().map(|profile| profile.model.clone()))
+            .unwrap_or_default(),
+        permission_mode: sidecar
+            .permission_mode
+            .clone()
+            .or_else(|| {
+                fallback
+                    .as_ref()
+                    .map(|profile| profile.permission_mode.clone())
+            })
+            .unwrap_or_else(|| "danger-full-access".to_string()),
+        allowed_tools: sidecar
+            .allowed_tools
+            .clone()
+            .or_else(|| {
+                fallback
+                    .as_ref()
+                    .map(|profile| profile.allowed_tools.clone())
+            })
+            .unwrap_or_default(),
+        keep_open: sidecar
+            .keep_open
+            .or_else(|| fallback.as_ref().map(|profile| profile.keep_open))
+            .unwrap_or(true),
+        prompt: sidecar
+            .prompt
+            .clone()
+            .or_else(|| fallback.as_ref().map(|profile| profile.prompt.clone()))
+            .unwrap_or_default(),
+        args: sidecar
+            .args
+            .clone()
+            .or_else(|| fallback.as_ref().map(|profile| profile.args.clone()))
+            .unwrap_or_default(),
+        respect_rate_limits: sidecar
+            .respect_rate_limits
+            .or_else(|| fallback.as_ref().map(|profile| profile.respect_rate_limits))
+            .unwrap_or(true),
+    })
+}
+
+fn merge_profiles_with_registry(
+    sidecar_profiles: Vec<ProviderProfile>,
+    registry_state: Option<&LauncherState>,
+) -> Vec<ProviderProfile> {
+    let Some(registry_state) = registry_state else {
+        return sidecar_profiles;
+    };
+    sidecar_profiles
+        .into_iter()
+        .map(|profile| {
+            let Some(registry_profile) = registry_state
+                .profiles
+                .iter()
+                .find(|candidate| candidate.friendly_name == profile.friendly_name)
+            else {
+                return profile;
+            };
+            merge_profile_with_registry_fallback(profile, registry_profile.clone())
+        })
+        .collect()
+}
+
+fn merge_profile_with_registry_fallback(
+    profile: ProviderProfile,
+    registry_profile: ProviderProfile,
+) -> ProviderProfile {
+    ProviderProfile {
+        friendly_name: profile.friendly_name,
+        provider_kind: profile.provider_kind,
+        api_key: if profile.api_key.trim().is_empty() {
+            registry_profile.api_key
+        } else {
+            profile.api_key
+        },
+        base_url: if profile.base_url.trim().is_empty() {
+            registry_profile.base_url
+        } else {
+            profile.base_url
+        },
+        workspace: if profile.workspace.as_os_str().is_empty() {
+            registry_profile.workspace
+        } else {
+            profile.workspace
+        },
+        model: if profile.model.trim().is_empty() {
+            registry_profile.model
+        } else {
+            profile.model
+        },
+        permission_mode: if profile.permission_mode.trim().is_empty() {
+            registry_profile.permission_mode
+        } else {
+            profile.permission_mode
+        },
+        allowed_tools: if profile.allowed_tools.is_empty() {
+            registry_profile.allowed_tools
+        } else {
+            profile.allowed_tools
+        },
+        keep_open: profile.keep_open,
+        prompt: if profile.prompt.trim().is_empty() {
+            registry_profile.prompt
+        } else {
+            profile.prompt
+        },
+        args: if profile.args.is_empty() {
+            registry_profile.args
+        } else {
+            profile.args
+        },
+        respect_rate_limits: profile.respect_rate_limits,
+    }
 }
 
 fn save_launcher_state(state: &LauncherState) -> Result<(), String> {
@@ -1024,19 +1413,42 @@ fn save_launcher_state(state: &LauncherState) -> Result<(), String> {
         .create_subkey(REGISTRY_PATH)
         .map_err(|error| format!("failed to open HKCU\\{}: {error}", REGISTRY_PATH))?;
     key.set_value(REGISTRY_STATE_VALUE, &body)
-        .map_err(|error| format!("failed to write launcher state to the registry: {error}"))
+        .map_err(|error| {
+            let message = format!("failed to write launcher state to the registry: {error}");
+            log_launcher_event(format!("save_launcher_state error={message}"));
+            message
+        })?;
+    log_launcher_event(format!(
+        "save_launcher_state profiles={} last_selected='{}' bytes={}",
+        state.profiles.len(),
+        state.last_selected.clone().unwrap_or_default(),
+        body.len()
+    ));
+    Ok(())
 }
 
-fn write_launch_profile(profile: &ProviderProfile, token_limit: (u32, u32)) -> Result<(), String> {
+fn write_launch_profile(
+    profile: &ProviderProfile,
+    token_limit: (u32, u32),
+    state: Option<&LauncherState>,
+) -> Result<(), String> {
     let launch_profile = LaunchProfileFile {
-        provider_name: profile.friendly_name.clone(),
-        provider_kind: profile.provider_kind,
-        model: profile.model.clone(),
-        base_url: profile.base_url.clone(),
-        workspace: profile.workspace.clone(),
-        context_window_tokens: token_limit.0,
-        max_output_tokens: token_limit.1,
-        respect_rate_limits: profile.respect_rate_limits,
+        provider_name: Some(profile.friendly_name.clone()),
+        provider_kind: Some(profile.provider_kind),
+        api_key: Some(profile.api_key.clone()),
+        model: Some(profile.model.clone()),
+        base_url: Some(profile.base_url.clone()),
+        workspace: Some(profile.workspace.clone()),
+        permission_mode: Some(profile.permission_mode.clone()),
+        allowed_tools: Some(profile.allowed_tools.clone()),
+        keep_open: Some(profile.keep_open),
+        prompt: Some(profile.prompt.clone()),
+        args: Some(profile.args.clone()),
+        context_window_tokens: Some(token_limit.0),
+        max_output_tokens: Some(token_limit.1),
+        respect_rate_limits: Some(profile.respect_rate_limits),
+        profiles: state.map(|state| state.profiles.clone()),
+        last_selected: Some(profile.friendly_name.clone()),
     };
     let body = serde_json::to_string_pretty(&launch_profile)
         .map_err(|error| format!("failed to serialize launch profile: {error}"))?;
@@ -1054,6 +1466,40 @@ fn current_exe_dir() -> Result<PathBuf, String> {
     exe.parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| format!("failed to resolve parent directory for {}", exe.display()))
+}
+
+fn launcher_log_path() -> Option<PathBuf> {
+    current_exe_dir()
+        .ok()
+        .map(|dir| dir.join(LAUNCHER_LOG_FILE_NAME))
+}
+
+fn log_launcher_event(message: impl AsRef<str>) {
+    let Some(path) = launcher_log_path() else {
+        return;
+    };
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "[{timestamp}] {}", message.as_ref());
+    }
+}
+
+fn resolve_powershell_executable() -> PathBuf {
+    if let Some(windir) = std::env::var_os("WINDIR") {
+        let candidate = PathBuf::from(windir)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from("powershell.exe")
 }
 
 fn ensure_runtime_available() -> Result<(), String> {
@@ -1082,16 +1528,25 @@ fn can_find_runtime_dll(name: &str) -> bool {
 }
 
 fn launch_env_vars(profile: &ProviderProfile) -> Vec<(&'static str, String)> {
-    vec![
+    let mut vars = vec![
         ("CLAW_MODEL", profile.model.clone()),
         ("CLAW_PROVIDER_NAME", profile.friendly_name.clone()),
         (
             "CLAW_RESPECT_RATE_LIMITS",
             profile.respect_rate_limits.to_string(),
         ),
-        ("OPENAI_API_KEY", profile.api_key.clone()),
-        ("OPENAI_BASE_URL", profile.base_url.clone()),
-    ]
+    ];
+    match profile.provider_kind {
+        ProviderKind::GoogleAiStudio => {
+            vars.push(("GOOGLE_API_KEY", profile.api_key.clone()));
+            vars.push(("GOOGLE_BASE_URL", profile.base_url.clone()));
+        }
+        _ => {
+            vars.push(("OPENAI_API_KEY", profile.api_key.clone()));
+            vars.push(("OPENAI_BASE_URL", profile.base_url.clone()));
+        }
+    }
+    vars
 }
 
 fn provider_default_token_limit(provider_kind: ProviderKind) -> (u32, u32) {
@@ -1189,6 +1644,20 @@ fn known_models() -> Vec<KnownModel> {
             tool_use_supported: false,
         },
         KnownModel {
+            id: "gemini-2.0-flash",
+            label: "Gemini 2.0 Flash",
+            context_window: 1_048_576,
+            max_output_tokens: 8_192,
+            tool_use_supported: true,
+        },
+        KnownModel {
+            id: "gemini-2.0-flash-lite",
+            label: "Gemini 2.0 Flash-Lite",
+            context_window: 1_048_576,
+            max_output_tokens: 8_192,
+            tool_use_supported: true,
+        },
+        KnownModel {
             id: "gpt-4.1-mini",
             label: "GPT-4.1 Mini",
             context_window: 1_047_576,
@@ -1229,6 +1698,7 @@ fn known_models() -> Vec<KnownModel> {
 fn initial_models(provider_kind: ProviderKind, base_url: &str, api_key: &str) -> Vec<ModelView> {
     let mut by_id = known_models()
         .into_iter()
+        .filter(model_is_applicable)
         .filter(|model| model_matches_provider(model.id, provider_kind))
         .map(|model| {
             (
@@ -1248,13 +1718,21 @@ fn initial_models(provider_kind: ProviderKind, base_url: &str, api_key: &str) ->
     if provider_kind.supports_remote_models() {
         if let Ok(remote_models) = fetch_models(provider_kind, base_url, api_key) {
             for remote_model in remote_models {
+                if !model_matches_provider(&remote_model.id, provider_kind)
+                    || !remote_model_is_applicable(&remote_model.id)
+                {
+                    continue;
+                }
                 let entry = by_id
                     .entry(remote_model.id.clone())
                     .or_insert_with(|| ModelView {
                         id: remote_model.id.clone(),
-                        label: remote_model.id.clone(),
-                        context_window: 131_072,
-                        max_output_tokens: 8_192,
+                        label: known_model_label(&remote_model.id)
+                            .unwrap_or_else(|| remote_model.id.clone()),
+                        context_window: known_model_context_window(&remote_model.id)
+                            .unwrap_or(131_072),
+                        max_output_tokens: known_model_max_output_tokens(&remote_model.id)
+                            .unwrap_or(8_192),
                         tool_use_supported: true,
                         from_api: true,
                     });
@@ -1304,20 +1782,87 @@ fn fetch_models(
 }
 
 fn model_matches_provider(model_id: &str, provider_kind: ProviderKind) -> bool {
+    let lowered = model_id.to_ascii_lowercase();
     match provider_kind {
-        ProviderKind::Groq => matches!(
-            model_id,
-            "llama-3.3-70b-versatile"
-                | "meta-llama/llama-4-scout-17b-16e-instruct"
-                | "groq/compound"
-                | "qwen/qwen3-32b"
-        ),
-        ProviderKind::OpenRouter => true,
-        ProviderKind::GoogleAiStudio => true,
+        ProviderKind::Groq => {
+            matches!(
+                model_id,
+                "llama-3.3-70b-versatile"
+                    | "meta-llama/llama-4-scout-17b-16e-instruct"
+                    | "qwen/qwen3-32b"
+            ) || lowered.starts_with("llama-")
+                || lowered.starts_with("mixtral")
+                || lowered.starts_with("gemma")
+                || lowered.starts_with("qwen/")
+                || lowered.starts_with("meta-llama/")
+                || lowered.starts_with("moonshotai/")
+                || lowered.starts_with("deepseek-")
+        }
+        ProviderKind::OpenRouter => lowered.contains('/'),
+        ProviderKind::GoogleAiStudio => lowered.starts_with("gemini-"),
         ProviderKind::Custom => true,
     }
 }
 
+fn model_is_applicable(model: &KnownModel) -> bool {
+    model.tool_use_supported && model.id != LEGACY_DEFAULT_MODEL
+}
+
+fn remote_model_is_applicable(model_id: &str) -> bool {
+    !model_id.trim().is_empty()
+}
+
+fn known_model_label(model_id: &str) -> Option<String> {
+    known_models()
+        .into_iter()
+        .find(|model| model.id == model_id)
+        .map(|model| model.label.to_string())
+}
+
+fn known_model_context_window(model_id: &str) -> Option<u32> {
+    known_models()
+        .into_iter()
+        .find(|model| model.id == model_id)
+        .map(|model| model.context_window)
+}
+
+fn known_model_max_output_tokens(model_id: &str) -> Option<u32> {
+    known_models()
+        .into_iter()
+        .find(|model| model.id == model_id)
+        .map(|model| model.max_output_tokens)
+}
+
 fn powershell_escape(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn cwd_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn default_workspace_uses_current_directory() {
+        let _guard = cwd_lock();
+        let root = std::env::temp_dir().join(format!(
+            "claw-launcher-default-workspace-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("workspace fixture");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("switch cwd");
+
+        assert_eq!(default_workspace(), root);
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
 }

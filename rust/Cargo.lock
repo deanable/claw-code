@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "api"
-version = "0.1.0"
+version = "1.1.1"
 dependencies = [
  "reqwest",
  "runtime",
@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "commands"
-version = "0.1.0"
+version = "1.1.1"
 dependencies = [
  "plugins",
  "runtime",
@@ -722,7 +722,7 @@ dependencies = [
 
 [[package]]
 name = "compat-harness"
-version = "0.1.0"
+version = "1.1.1"
 dependencies = [
  "commands",
  "runtime",
@@ -1970,14 +1970,14 @@ dependencies = [
 
 [[package]]
 name = "libredox"
-version = "0.1.15"
+version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ddbf48fd451246b1f8c2610bd3b4ac0cc6e149d89832867093ab69a17194f08"
+checksum = "e02f3bb43d335493c96bf3fd3a321600bf6bd07ed34bc64118e9293bdffea46c"
 dependencies = [
  "bitflags 2.11.0",
  "libc",
  "plain",
- "redox_syscall 0.7.3",
+ "redox_syscall 0.7.4",
 ]
 
 [[package]]
@@ -2103,7 +2103,7 @@ dependencies = [
 
 [[package]]
 name = "mock-anthropic-service"
-version = "0.1.0"
+version = "1.1.1"
 dependencies = [
  "api",
  "serde_json",
@@ -2698,7 +2698,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.1.0"
+version = "1.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3009,9 +3009,9 @@ dependencies = [
 
 [[package]]
 name = "redox_syscall"
-version = "0.7.3"
+version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ce70a74e890531977d37e532c34d45e9055d2409ed08ddba14529471ed0be16"
+checksum = "f450ad9c3b1da563fb6948a8e0fb0fb9269711c9c73d9ea1de5058c79c8d643a"
 dependencies = [
  "bitflags 2.11.0",
 ]
@@ -3131,7 +3131,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.1.0"
+version = "1.1.1"
 dependencies = [
  "getrandom 0.3.4",
  "glob",
@@ -3235,7 +3235,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rusty-claude-cli"
-version = "0.1.0"
+version = "1.1.1"
 dependencies = [
  "api",
  "commands",
@@ -3696,7 +3696,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "0.1.0"
+version = "1.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3949,7 +3949,7 @@ checksum = "756daf9b1013ebe47a8776667b466417e2d4c5679d441c26230efd9ef78692db"
 
 [[package]]
 name = "tools"
-version = "0.1.0"
+version = "1.1.1"
 dependencies = [
  "api",
  "commands",

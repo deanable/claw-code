@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -59,10 +58,10 @@ impl OpenAiCompatConfig {
         }
     }
 
-    /// Alibaba DashScope compatible-mode endpoint (Qwen family models).
+    /// Alibaba `DashScope` compatible-mode endpoint (Qwen family models).
     /// Uses the OpenAI-compatible REST shape at /compatible-mode/v1.
     /// Requested via Discord #clawcode-get-help: native Alibaba API for
-    /// higher rate limits than going through OpenRouter.
+    /// higher rate limits than going through `OpenRouter`.
     #[must_use]
     pub const fn dashscope() -> Self {
         Self {
@@ -84,7 +83,7 @@ impl OpenAiCompatConfig {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OpenAiCompatClient {
     http: reqwest::Client,
     api_key: String,
@@ -93,26 +92,6 @@ pub struct OpenAiCompatClient {
     max_retries: u32,
     initial_backoff: Duration,
     max_backoff: Duration,
-    respect_rate_limits: bool,
-    request_count: AtomicU64,
-    window_start: Mutex<SystemTime>,
-}
-
-impl Clone for OpenAiCompatClient {
-    fn clone(&self) -> Self {
-        Self {
-            http: self.http.clone(),
-            api_key: self.api_key.clone(),
-            config: self.config,
-            base_url: self.base_url.clone(),
-            max_retries: self.max_retries,
-            initial_backoff: self.initial_backoff,
-            max_backoff: self.max_backoff,
-            respect_rate_limits: self.respect_rate_limits,
-            request_count: AtomicU64::new(0),
-            window_start: Mutex::new(SystemTime::now()),
-        }
-    }
 }
 
 impl OpenAiCompatClient {
@@ -134,11 +113,6 @@ impl OpenAiCompatClient {
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
-            respect_rate_limits: std::env::var("CLAW_RESPECT_RATE_LIMITS")
-                .map(|v| v == "true")
-                .unwrap_or(true),
-            request_count: AtomicU64::new(0),
-            window_start: Mutex::new(SystemTime::now()),
         }
     }
 
@@ -150,12 +124,6 @@ impl OpenAiCompatClient {
             ));
         };
         Ok(Self::new(api_key, config))
-    }
-
-    #[must_use]
-    pub fn with_respect_rate_limits(mut self, respect: bool) -> Self {
-        self.respect_rate_limits = respect;
-        self
     }
 
     #[must_use]
@@ -202,18 +170,11 @@ impl OpenAiCompatClient {
                     .to_string();
                 let code = err_obj
                     .get("code")
-                    .and_then(|c| c.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                     .map(|c| c as u16);
-                let status = reqwest::StatusCode::from_u16(code.unwrap_or(400))
-                    .unwrap_or(reqwest::StatusCode::BAD_REQUEST);
-                let retryable = is_retryable_error_payload(
-                    status,
-                    err_obj.get("type").and_then(|t| t.as_str()),
-                    Some(&msg),
-                    &body,
-                );
                 return Err(ApiError::Api {
-                    status,
+                    status: reqwest::StatusCode::from_u16(code.unwrap_or(400))
+                        .unwrap_or(reqwest::StatusCode::BAD_REQUEST),
                     error_type: err_obj
                         .get("type")
                         .and_then(|t| t.as_str())
@@ -221,7 +182,7 @@ impl OpenAiCompatClient {
                     message: Some(msg),
                     request_id,
                     body,
-                    retryable,
+                    retryable: false,
                 });
             }
         }
@@ -257,21 +218,13 @@ impl OpenAiCompatClient {
         &self,
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
-        if self.respect_rate_limits {
-            self.wait_for_rate_limit().await;
-        }
         let mut attempts = 0;
 
         let last_error = loop {
             attempts += 1;
             let retryable_error = match self.send_raw_request(request).await {
                 Ok(response) => match expect_success(response).await {
-                    Ok(response) => {
-                        if self.respect_rate_limits {
-                            self.record_request();
-                        }
-                        return Ok(response);
-                    }
+                    Ok(response) => return Ok(response),
                     Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => error,
                     Err(error) => return Err(error),
                 },
@@ -292,53 +245,16 @@ impl OpenAiCompatClient {
         })
     }
 
-    async fn wait_for_rate_limit(&self) {
-        const MAX_REQUESTS_PER_MINUTE: u64 = 30;
-        const WINDOW_SECS: u64 = 60;
-
-        loop {
-            let now = SystemTime::now();
-            let (elapsed, _count) = {
-                let mut window = self.window_start.lock().unwrap();
-                let elapsed = now.duration_since(*window).map(|d| d.as_secs()).unwrap_or(WINDOW_SECS + 1);
-
-                if elapsed >= WINDOW_SECS {
-                    *window = now;
-                    self.request_count.store(0, Ordering::SeqCst);
-                    return;
-                }
-
-                let count = self.request_count.load(Ordering::SeqCst);
-                if count < MAX_REQUESTS_PER_MINUTE {
-                    return;
-                }
-                (elapsed, count)
-            };
-
-            let wait_time = WINDOW_SECS - elapsed;
-            tokio::time::sleep(Duration::from_secs(wait_time)).await;
-        }
-    }
-
-    fn record_request(&self) {
-        self.request_count.fetch_add(1, Ordering::SeqCst);
-    }
-
     async fn send_raw_request(
         &self,
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = chat_completions_endpoint(&self.base_url);
-        let payload = build_chat_completion_request(request, self.config());
-        let _ = std::fs::write(
-            std::env::temp_dir().join("claw-openai-compat-last-request.json"),
-            serde_json::to_vec_pretty(&payload).unwrap_or_default(),
-        );
         self.http
             .post(&request_url)
             .header("content-type", "application/json")
             .bearer_auth(&self.api_key)
-            .json(&payload)
+            .json(&build_chat_completion_request(request, self.config()))
             .send()
             .await
             .map_err(ApiError::from)
@@ -833,27 +749,8 @@ struct ErrorBody {
     message: Option<String>,
 }
 
-fn is_retryable_error_payload(
-    status: reqwest::StatusCode,
-    error_type: Option<&str>,
-    message: Option<&str>,
-    body: &str,
-) -> bool {
-    if is_retryable_status(status) {
-        return true;
-    }
-    error_type.is_some_and(|kind| kind.eq_ignore_ascii_case("provider_unavailable"))
-        || message.is_some_and(|text| {
-            text.to_ascii_lowercase()
-                .contains("network connection lost")
-        })
-        || body
-            .to_ascii_lowercase()
-            .contains("\"error_type\":\"provider_unavailable\"")
-}
-
 /// Returns true for models known to reject tuning parameters like temperature,
-/// top_p, frequency_penalty, and presence_penalty. These are typically
+/// `top_p`, `frequency_penalty`, and `presence_penalty`. These are typically
 /// reasoning/chain-of-thought models with fixed sampling.
 fn is_reasoning_model(model: &str) -> bool {
     let lowered = model.to_ascii_lowercase();
@@ -1016,11 +913,12 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                 InputContentBlock::ToolResult {
                     tool_use_id,
                     content,
-                    is_error: _,
+                    is_error,
                 } => Some(json!({
                     "role": "tool",
                     "tool_call_id": tool_use_id,
                     "content": flatten_tool_result_content(content),
+                    "is_error": is_error,
                 })),
                 InputContentBlock::ToolUse { .. } => None,
             })
@@ -1076,12 +974,11 @@ fn sanitize_tool_message_pairing(messages: Vec<Value>) -> Vec<Value> {
         }
         let paired = preceding
             .and_then(|m| m.get("tool_calls").and_then(|tc| tc.as_array()))
-            .map(|tool_calls| {
+            .is_some_and(|tool_calls| {
                 tool_calls
                     .iter()
                     .any(|tc| tc.get("id").and_then(|v| v.as_str()) == Some(tool_call_id))
-            })
-            .unwrap_or(false);
+            });
         if !paired {
             drop_indices.insert(i);
         }
@@ -1110,7 +1007,7 @@ fn flatten_tool_result_content(content: &[ToolResultContentBlock]) -> String {
 
 /// Recursively ensure every object-type node in a JSON Schema has
 /// `"properties"` (at least `{}`) and `"additionalProperties": false`.
-/// The OpenAI `/responses` endpoint validates schemas strictly and rejects
+/// The `OpenAI` `/responses` endpoint validates schemas strictly and rejects
 /// objects that omit these fields; `/chat/completions` is lenient but also
 /// accepts them, so we normalise unconditionally.
 fn normalize_object_schema(schema: &mut Value) {
@@ -1275,16 +1172,10 @@ fn parse_sse_frame(
                 .to_string();
             let code = err_obj
                 .get("code")
-                .and_then(|c| c.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .map(|c| c as u16);
             let status = reqwest::StatusCode::from_u16(code.unwrap_or(400))
                 .unwrap_or(reqwest::StatusCode::BAD_REQUEST);
-            let retryable = is_retryable_error_payload(
-                status,
-                err_obj.get("type").and_then(|t| t.as_str()),
-                Some(&msg),
-                &payload,
-            );
             return Err(ApiError::Api {
                 status,
                 error_type: err_obj
@@ -1293,8 +1184,8 @@ fn parse_sse_frame(
                     .map(str::to_owned),
                 message: Some(msg),
                 request_id: None,
-                body: payload.to_string(),
-                retryable,
+                body: payload.clone(),
+                retryable: false,
             });
         }
     }
@@ -1350,16 +1241,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     let request_id = request_id_from_headers(response.headers());
     let body = response.text().await.unwrap_or_default();
     let parsed_error = serde_json::from_str::<ErrorEnvelope>(&body).ok();
-    let retryable = is_retryable_error_payload(
-        status,
-        parsed_error
-            .as_ref()
-            .and_then(|error| error.error.error_type.as_deref()),
-        parsed_error
-            .as_ref()
-            .and_then(|error| error.error.message.as_deref()),
-        &body,
-    );
+    let retryable = is_retryable_status(status);
 
     Err(ApiError::Api {
         status,
@@ -1406,8 +1288,8 @@ impl StringExt for String {
 mod tests {
     use super::{
         build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
-        is_retryable_error_payload, normalize_finish_reason, openai_tool_choice,
-        parse_tool_arguments, OpenAiCompatClient, OpenAiCompatConfig,
+        normalize_finish_reason, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,
+        OpenAiCompatConfig,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -1526,16 +1408,6 @@ mod tests {
             OpenAiCompatConfig::openai(),
         );
         assert!(payload.get("reasoning_effort").is_none());
-    }
-
-    #[test]
-    fn provider_unavailable_payloads_are_treated_as_retryable() {
-        assert!(is_retryable_error_payload(
-            reqwest::StatusCode::OK,
-            Some("provider_unavailable"),
-            Some("Network connection lost."),
-            r#"{"error":{"metadata":{"error_type":"provider_unavailable"}}}"#,
-        ));
     }
 
     #[test]
@@ -1769,6 +1641,16 @@ mod tests {
     /// Before the fix this produced: `invalid type: null, expected a sequence`.
     #[test]
     fn delta_with_null_tool_calls_deserializes_as_empty_vec() {
+        use super::deserialize_null_as_empty_vec;
+
+        #[allow(dead_code)]
+        #[derive(serde::Deserialize, Debug)]
+        struct Delta {
+            content: Option<String>,
+            #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
+            tool_calls: Vec<super::DeltaToolCall>,
+        }
+
         // Simulate the exact shape observed in the wild (gaebal-gajae repro 2026-04-09)
         let json = r#"{
             "content": "",
@@ -1777,15 +1659,6 @@ mod tests {
             "role": "assistant",
             "tool_calls": null
         }"#;
-
-        use super::deserialize_null_as_empty_vec;
-        #[derive(serde::Deserialize, Debug)]
-        struct Delta {
-            #[allow(dead_code)]
-            content: Option<String>,
-            #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
-            tool_calls: Vec<super::DeltaToolCall>,
-        }
         let delta: Delta = serde_json::from_str(json)
             .expect("delta with tool_calls:null must deserialize without error");
         assert!(
@@ -1797,7 +1670,7 @@ mod tests {
     /// Regression: when building a multi-turn request where a prior assistant
     /// turn has no tool calls, the serialized assistant message must NOT include
     /// `tool_calls: []`. Some providers reject requests that carry an empty
-    /// tool_calls array on assistant turns (gaebal-gajae repro 2026-04-09).
+    /// `tool_calls` array on assistant turns (gaebal-gajae repro 2026-04-09).
     #[test]
     fn assistant_message_without_tool_calls_omits_tool_calls_field() {
         use crate::types::{InputContentBlock, InputMessage};
@@ -1822,13 +1695,12 @@ mod tests {
             .expect("assistant message must be present");
         assert!(
             assistant_msg.get("tool_calls").is_none(),
-            "assistant message without tool calls must omit tool_calls field: {:?}",
-            assistant_msg
+            "assistant message without tool calls must omit tool_calls field: {assistant_msg:?}"
         );
     }
 
     /// Regression: assistant messages WITH tool calls must still include
-    /// the tool_calls array (normal multi-turn tool-use flow).
+    /// the `tool_calls` array (normal multi-turn tool-use flow).
     #[test]
     fn assistant_message_with_tool_calls_includes_tool_calls_field() {
         use crate::types::{InputContentBlock, InputMessage};
@@ -1860,7 +1732,7 @@ mod tests {
         assert_eq!(tool_calls.as_array().unwrap().len(), 1);
     }
 
-    /// Orphaned tool messages (no preceding assistant tool_calls) must be
+    /// Orphaned tool messages (no preceding assistant `tool_calls`) must be
     /// dropped by the request-builder sanitizer. Regression for the second
     /// layer of the tool-pairing invariant fix (gaebal-gajae 2026-04-10).
     #[test]

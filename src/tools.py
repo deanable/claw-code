@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import platform
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -37,6 +38,42 @@ def load_tool_snapshot() -> tuple[PortingModule, ...]:
 PORTED_TOOLS = load_tool_snapshot()
 
 
+def _platform_family(platform_name: str | None = None) -> str:
+    name = (platform_name or platform.platform()).lower()
+    if 'windows' in name:
+        return 'windows'
+    if 'darwin' in name or 'mac' in name:
+        return 'mac'
+    return 'posix'
+
+
+def _shell_sort_key(module: PortingModule, platform_name: str | None = None) -> tuple[int, str, str]:
+    family = _platform_family(platform_name)
+    lowered_name = module.name.lower()
+    lowered_hint = module.source_hint.lower()
+    if family == 'windows':
+        if lowered_name == 'powershelltool':
+            return (0, lowered_name, lowered_hint)
+        if 'powershelltool' in lowered_hint:
+            return (1, lowered_name, lowered_hint)
+        if 'terminalsetup' in lowered_name or 'terminalsetup' in lowered_hint:
+            return (1, lowered_name, lowered_hint)
+        if lowered_name == 'bashtool':
+            return (100, lowered_name, lowered_hint)
+        if 'bashtool' in lowered_hint:
+            return (100, lowered_name, lowered_hint)
+    else:
+        if lowered_name == 'bashtool':
+            return (0, lowered_name, lowered_hint)
+        if 'bashtool' in lowered_hint:
+            return (1, lowered_name, lowered_hint)
+        if lowered_name == 'powershelltool':
+            return (20, lowered_name, lowered_hint)
+        if 'powershelltool' in lowered_hint:
+            return (21, lowered_name, lowered_hint)
+    return (10, lowered_name, lowered_hint)
+
+
 def build_tool_backlog() -> PortingBacklog:
     return PortingBacklog(title='Tool surface', modules=list(PORTED_TOOLS))
 
@@ -63,13 +100,17 @@ def get_tools(
     simple_mode: bool = False,
     include_mcp: bool = True,
     permission_context: ToolPermissionContext | None = None,
+    platform_name: str | None = None,
 ) -> tuple[PortingModule, ...]:
     tools = list(PORTED_TOOLS)
     if simple_mode:
-        tools = [module for module in tools if module.name in {'BashTool', 'FileReadTool', 'FileEditTool'}]
+        preferred_shell = 'PowerShellTool' if _platform_family(platform_name) == 'windows' else 'BashTool'
+        tools = [module for module in tools if module.name in {preferred_shell, 'FileReadTool', 'FileEditTool'}]
     if not include_mcp:
         tools = [module for module in tools if 'mcp' not in module.name.lower() and 'mcp' not in module.source_hint.lower()]
-    return filter_tools_by_permission_context(tuple(tools), permission_context)
+    tools = list(filter_tools_by_permission_context(tuple(tools), permission_context))
+    tools.sort(key=lambda module: _shell_sort_key(module, platform_name))
+    return tuple(tools)
 
 
 def find_tools(query: str, limit: int = 20) -> list[PortingModule]:
