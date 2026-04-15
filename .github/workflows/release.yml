@@ -35,48 +35,53 @@ jobs:
       - name: Build release binaries
         run: cargo build --release -p rusty-claude-cli --bins
 
-      - name: Package Windows release assets
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Stage Windows installer files
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}"
+          $tag = "${{ github.ref_name }}"
+          $version = $tag.TrimStart('v')
           $dist = Join-Path $PWD "dist"
-          $package = Join-Path $dist "package"
+          $package = Join-Path $dist "installer-root"
           New-Item -ItemType Directory -Force -Path $dist | Out-Null
           New-Item -ItemType Directory -Force -Path $package | Out-Null
 
           $claw = Join-Path $dist "claw-$version-windows-x64.exe"
           $launcher = Join-Path $dist "claw-launcher-$version-windows-x64.exe"
           $readme = Join-Path $package "README.txt"
-          $installer = Join-Path $dist "claw-$version-windows-x64-installer.zip"
+          $installerReadme = Join-Path "..\installer" "README.txt"
 
           Copy-Item "target\release\claw.exe" $claw -Force
           Copy-Item "target\release\claw-launcher.exe" $launcher -Force
-          Copy-Item "..\release\README.txt" $readme -Force
-          Copy-Item "..\release\.claw" $package -Recurse -Force
-
-          if (Test-Path $installer) {
-            Remove-Item $installer -Force
-          }
-
+          Copy-Item $installerReadme $readme -Force
+          Copy-Item "..\rust\.claw" $package -Recurse -Force
           Copy-Item $claw (Join-Path $package (Split-Path $claw -Leaf)) -Force
           Copy-Item $launcher (Join-Path $package (Split-Path $launcher -Leaf)) -Force
-          Compress-Archive -Path (Join-Path $package '*') -DestinationPath $installer -Force
+          Copy-Item "..\installer\claw.iss" (Join-Path $dist "claw.iss") -Force
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag.TrimStart('v')
+          $dist = Join-Path $PWD "dist"
+          $package = Join-Path $dist "installer-root"
+          $iscc = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) "Inno Setup 6\ISCC.exe"
+
+          & $iscc "/DAppVersion=$version" "/DSourceRoot=$package" "/DOutputDir=$dist" "dist\claw.iss"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: claw-windows-x64
-          path: |
-            rust/dist/claw-${{ github.ref_name }}-windows-x64.exe
-            rust/dist/claw-launcher-${{ github.ref_name }}-windows-x64.exe
-            rust/dist/claw-${{ github.ref_name }}-windows-x64-installer.zip
+          name: claw-windows-installer
+          path: rust/dist/claw-*-windows-x64-installer.exe
 
       - name: Upload release assets
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            rust/dist/claw-${{ github.ref_name }}-windows-x64.exe
-            rust/dist/claw-launcher-${{ github.ref_name }}-windows-x64.exe
-            rust/dist/claw-${{ github.ref_name }}-windows-x64-installer.zip
+          files: rust/dist/claw-*-windows-x64-installer.exe
           fail_on_unmatched_files: true
