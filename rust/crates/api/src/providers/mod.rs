@@ -8,6 +8,7 @@ use crate::error::ApiError;
 use crate::types::{MessageRequest, MessageResponse};
 
 pub mod anthropic;
+pub mod google_ai_studio;
 pub mod openai_compat;
 
 #[allow(dead_code)]
@@ -31,6 +32,7 @@ pub trait Provider {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     Anthropic,
+    GoogleAiStudio,
     Xai,
     OpenAi,
 }
@@ -145,6 +147,7 @@ pub fn resolve_model_alias(model: &str) -> String {
                     _ => trimmed,
                 },
                 ProviderKind::OpenAi => trimmed,
+                ProviderKind::GoogleAiStudio => trimmed,
             })
         })
         .map_or_else(|| trimmed.to_string(), ToOwned::to_owned)
@@ -167,6 +170,14 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             auth_env: "XAI_API_KEY",
             base_url_env: "XAI_BASE_URL",
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
+        });
+    }
+    if canonical.starts_with("gemini-") || canonical.starts_with("google/") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::GoogleAiStudio,
+            auth_env: "GOOGLE_API_KEY",
+            base_url_env: "GOOGLE_BASE_URL",
+            default_base_url: google_ai_studio::DEFAULT_GOOGLE_BASE_URL,
         });
     }
     // Explicit provider-namespaced models (e.g. "openai/gpt-4.1-mini") must
@@ -213,6 +224,9 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     }
     if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
         return ProviderKind::Anthropic;
+    }
+    if google_ai_studio::has_api_key("GOOGLE_API_KEY") {
+        return ProviderKind::GoogleAiStudio;
     }
     if openai_compat::has_api_key("OPENAI_API_KEY") {
         return ProviderKind::OpenAi;
@@ -267,6 +281,22 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 64_000,
             context_window_tokens: 131_072,
         }),
+        "openai/gpt-oss-120b" | "openai/gpt-oss-20b" => Some(ModelTokenLimit {
+            max_output_tokens: 4_096,
+            context_window_tokens: 131_072,
+        }),
+        "llama-3.3-70b-versatile" => Some(ModelTokenLimit {
+            max_output_tokens: 4_096,
+            context_window_tokens: 131_072,
+        }),
+        "groq/compound" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 131_072,
+        }),
+        "gemini-2.0-flash" | "gemini-2.0-flash-lite" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 1_048_576,
+        }),
         _ => None,
     }
 }
@@ -310,6 +340,11 @@ fn estimate_serialized_tokens<T: Serialize>(value: &T) -> u32 {
 /// credentials probably belong to a different provider and suggest the
 /// model-prefix routing fix that would select it.
 const FOREIGN_PROVIDER_ENV_VARS: &[(&str, &str, &str)] = &[
+    (
+        "GOOGLE_API_KEY",
+        "Google AI Studio",
+        "use a Gemini model name (for example `--model gemini-2.0-flash`) so provider routing selects the native Google backend, and set `GOOGLE_BASE_URL` only if you need a non-default Gemini API endpoint",
+    ),
     (
         "OPENAI_API_KEY",
         "OpenAI-compat",

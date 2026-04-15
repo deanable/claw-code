@@ -1,0 +1,1868 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use eframe::egui::{self, Color32, IconData, RichText, TextEdit};
+use reqwest::blocking::Client;
+use serde::{Deserialize, Serialize};
+use winreg::enums::HKEY_CURRENT_USER;
+use winreg::RegKey;
+
+const VC_REDIST_URL: &str =
+    "https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170";
+const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+const SYSTEM_PROMPT_ESTIMATE: u32 = 2_500;
+const BASE_REQUEST_OVERHEAD: u32 = 1_500;
+const REGISTRY_PATH: &str = "Software\\ClawLauncher";
+const REGISTRY_STATE_VALUE: &str = "LauncherState";
+const LAUNCH_PROMPT_ENV_VAR: &str = "CLAW_LAUNCH_PROMPT";
+const LEGACY_DEFAULT_MODEL: &str = "llama-3.3-70b-versatile";
+const NEW_PROVIDER_KEY: &str = "__new_provider__";
+const LAUNCH_PROFILE_FILE_NAME: &str = ".claw-launch.json";
+const LAUNCHER_LOG_FILE_NAME: &str = "claw-launcher.log";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum ProviderKind {
+    Groq,
+    OpenRouter,
+    GoogleAiStudio,
+    Custom,
+}
+
+impl ProviderKind {
+    fn all() -> [Self; 4] {
+        [
+            Self::Groq,
+            Self::OpenRouter,
+            Self::GoogleAiStudio,
+            Self::Custom,
+        ]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Groq => "Groq",
+            Self::OpenRouter => "OpenRouter",
+            Self::GoogleAiStudio => "Google AI Studio",
+            Self::Custom => "Custom",
+        }
+    }
+
+    fn supports_remote_models(self) -> bool {
+        !matches!(self, Self::GoogleAiStudio)
+    }
+
+    fn requires_api_key(self) -> bool {
+        true
+    }
+
+    fn api_key_url(self) -> &'static str {
+        match self {
+            Self::Groq => "https://console.groq.com/keys",
+            Self::OpenRouter => "https://openrouter.ai/keys",
+            Self::GoogleAiStudio => "https://aistudio.google.com/app/apikey",
+            Self::Custom => "https://platform.openai.com/api-keys",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderProfile {
+    friendly_name: String,
+    provider_kind: ProviderKind,
+    api_key: String,
+    base_url: String,
+    workspace: PathBuf,
+    model: String,
+    permission_mode: String,
+    allowed_tools: Vec<String>,
+    keep_open: bool,
+    prompt: String,
+    args: Vec<String>,
+    respect_rate_limits: bool,
+}
+
+impl ProviderProfile {
+    fn from_preset(preset: ProviderPreset) -> Self {
+        Self {
+            friendly_name: preset.name.to_string(),
+            provider_kind: preset.kind,
+            api_key: String::new(),
+            base_url: preset.base_url.to_string(),
+            workspace: default_workspace(),
+            model: preset.model.to_string(),
+            permission_mode: "danger-full-access".to_string(),
+            allowed_tools: vec!["read".to_string(), "glob".to_string(), "grep".to_string()],
+            keep_open: true,
+            prompt: String::new(),
+            args: Vec::new(),
+            respect_rate_limits: true,
+        }
+    }
+}
+
+impl Default for ProviderProfile {
+    fn default() -> Self {
+        Self::from_preset(provider_presets()[0])
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LauncherState {
+    profiles: Vec<ProviderProfile>,
+    last_selected: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyLauncherConfig {
+    workspace: PathBuf,
+    model: String,
+    permission_mode: String,
+    allowed_tools: Vec<String>,
+    keep_open: bool,
+    prompt: Option<String>,
+    openai_api_key: String,
+    openai_base_url: String,
+    args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProviderPreset {
+    kind: ProviderKind,
+    name: &'static str,
+    base_url: &'static str,
+    model: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct ToolOption {
+    id: &'static str,
+    label: &'static str,
+    description: &'static str,
+    estimated_tokens: u32,
+}
+
+#[derive(Debug, Clone)]
+struct KnownModel {
+    id: &'static str,
+    label: &'static str,
+    context_window: u32,
+    max_output_tokens: u32,
+    tool_use_supported: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ModelView {
+    id: String,
+    label: String,
+    context_window: u32,
+    max_output_tokens: u32,
+    tool_use_supported: bool,
+    from_api: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiCompatModelList {
+    data: Vec<OpenAiCompatModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiCompatModel {
+    id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LaunchProfileFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_kind: Option<ProviderKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    allowed_tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    keep_open: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    args: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_window_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    respect_rate_limits: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profiles: Option<Vec<ProviderProfile>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_selected: Option<String>,
+}
+
+struct LauncherApp {
+    exe_dir: PathBuf,
+    claw_path: PathBuf,
+    legacy_config_path: PathBuf,
+    state: LauncherState,
+    selected_provider: String,
+    draft: ProviderProfile,
+    args_text: String,
+    selected_tools: BTreeSet<String>,
+    models: Vec<ModelView>,
+    model_search_filter: String,
+    status: String,
+}
+
+fn main() -> Result<(), eframe::Error> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([900.0, 780.0])
+            .with_icon(load_launcher_window_icon()),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Claw Launcher",
+        options,
+        Box::new(|_cc| Ok(Box::new(LauncherApp::new()))),
+    )
+}
+
+impl LauncherApp {
+    fn new() -> Self {
+        let exe_dir = current_exe_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let legacy_config_path = exe_dir.join("claw-launcher.json");
+        let claw_path = exe_dir.join("claw.exe");
+        let (state, status) = load_launcher_state(&legacy_config_path);
+        log_launcher_event(format!(
+            "startup exe_dir='{}' claw_path='{}' status='{}'",
+            exe_dir.display(),
+            claw_path.display(),
+            status
+        ));
+        let selected_provider = state
+            .last_selected
+            .clone()
+            .filter(|name| {
+                state
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.friendly_name == *name)
+            })
+            .or_else(|| {
+                state
+                    .profiles
+                    .first()
+                    .map(|profile| profile.friendly_name.clone())
+            })
+            .unwrap_or_else(|| NEW_PROVIDER_KEY.to_string());
+        let mut app = Self {
+            exe_dir,
+            claw_path,
+            legacy_config_path,
+            state,
+            selected_provider,
+            draft: ProviderProfile::default(),
+            args_text: String::new(),
+            selected_tools: BTreeSet::new(),
+            models: Vec::new(),
+            model_search_filter: String::new(),
+            status,
+        };
+        app.load_selected_provider();
+        if !app.claw_path.is_file() {
+            app.status = format!("Missing {} next to the launcher.", app.claw_path.display());
+            log_launcher_event(app.status.clone());
+        }
+        app
+    }
+
+    fn current_profile_index(&self) -> Option<usize> {
+        self.state
+            .profiles
+            .iter()
+            .position(|profile| profile.friendly_name == self.selected_provider)
+    }
+
+    fn load_selected_provider(&mut self) {
+        let profile = self
+            .current_profile_index()
+            .map(|index| self.state.profiles[index].clone())
+            .unwrap_or_default();
+        log_launcher_event(format!(
+            "load_selected_provider selected='{}' resolved='{}' model='{}' workspace='{}'",
+            self.selected_provider,
+            profile.friendly_name,
+            profile.model,
+            profile.workspace.display()
+        ));
+        self.set_editor_profile(profile);
+        self.refresh_models_with_status(false);
+    }
+
+    fn set_editor_profile(&mut self, profile: ProviderProfile) {
+        self.selected_tools = profile.allowed_tools.iter().cloned().collect();
+        self.args_text = profile.args.join("\n");
+        self.model_search_filter.clear();
+        self.draft = profile;
+    }
+
+    fn sync_editor_profile(&mut self) {
+        self.draft.allowed_tools = self.selected_tools.iter().cloned().collect();
+        self.draft.args = self
+            .args_text
+            .lines()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+    }
+
+    fn filtered_models(&self) -> Vec<&ModelView> {
+        let query = self.model_search_filter.trim().to_ascii_lowercase();
+        self.models
+            .iter()
+            .filter(|model| {
+                query.is_empty()
+                    || model.id.to_ascii_lowercase().contains(&query)
+                    || model.label.to_ascii_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
+    fn selected_model(&self) -> Option<&ModelView> {
+        self.models
+            .iter()
+            .find(|model| model.id == self.draft.model)
+    }
+
+    fn selected_token_limit(&self) -> (u32, u32) {
+        self.selected_model()
+            .map(|model| (model.context_window, model.max_output_tokens))
+            .unwrap_or_else(|| provider_default_token_limit(self.draft.provider_kind))
+    }
+
+    fn apply_preset(&mut self, preset: ProviderPreset) {
+        let kind_changed = self.draft.provider_kind != preset.kind;
+        self.draft.provider_kind = preset.kind;
+        self.draft.base_url = preset.base_url.to_string();
+        self.draft.model = preset.model.to_string();
+        if kind_changed {
+            self.draft.api_key.clear();
+        }
+        if self.selected_provider == NEW_PROVIDER_KEY
+            || self.draft.friendly_name.trim().is_empty()
+            || provider_presets()
+                .iter()
+                .any(|candidate| candidate.name == self.draft.friendly_name)
+        {
+            self.draft.friendly_name = preset.name.to_string();
+        }
+        self.refresh_models_with_status(true);
+    }
+
+    fn open_api_key_site(&mut self) {
+        let url = if matches!(self.draft.provider_kind, ProviderKind::Custom)
+            && !self.draft.base_url.trim().is_empty()
+        {
+            self.draft.base_url.trim().to_string()
+        } else {
+            self.draft.provider_kind.api_key_url().to_string()
+        };
+        match webbrowser::open(&url) {
+            Ok(()) => {
+                self.status = format!(
+                    "Opened {} so you can create an API key.",
+                    self.draft.provider_kind.label()
+                );
+            }
+            Err(error) => {
+                self.status = format!("Failed to open {url}: {error}");
+            }
+        }
+    }
+
+    fn refresh_models_with_status(&mut self, set_status: bool) {
+        self.models = initial_models(
+            self.draft.provider_kind,
+            &self.draft.base_url,
+            &self.draft.api_key,
+        );
+        if self.models.iter().all(|model| model.id != self.draft.model) {
+            if let Some(first) = self.models.first() {
+                self.draft.model = first.id.clone();
+            }
+        }
+        self.sanitize_selected_tools();
+        if set_status {
+            self.status = if self.draft.api_key.trim().is_empty()
+                && self.draft.provider_kind.requires_api_key()
+            {
+                format!(
+                    "Add an API key for {} to load live models.",
+                    self.draft.provider_kind.label()
+                )
+            } else {
+                format!("Loaded models for {}.", self.draft.provider_kind.label())
+            };
+        }
+    }
+
+    fn apply_model_search(&mut self) {
+        let matches = self.filtered_models().len();
+        self.status = if self.model_search_filter.is_empty() {
+            "Showing all known models for this provider.".to_string()
+        } else if matches == 0 {
+            format!(
+                "No known models matched '{}'. You can still launch with the typed model id.",
+                self.model_search_filter
+            )
+        } else {
+            format!(
+                "Filtered known models with '{}'. {} match{}.",
+                self.model_search_filter,
+                matches,
+                if matches == 1 { "" } else { "es" }
+            )
+        };
+    }
+
+    fn model_supports_tools(&self) -> bool {
+        self.selected_model()
+            .map(|model| model.tool_use_supported)
+            .unwrap_or(true)
+    }
+
+    fn available_tool_options(&self) -> Vec<ToolOption> {
+        if self.model_supports_tools() {
+            available_tools()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn sanitize_selected_tools(&mut self) {
+        if self.model_supports_tools() {
+            let valid_tool_ids = available_tools()
+                .into_iter()
+                .map(|tool| tool.id.to_string())
+                .collect::<BTreeSet<_>>();
+            self.selected_tools
+                .retain(|tool| valid_tool_ids.contains(tool));
+        } else {
+            self.selected_tools.clear();
+        }
+    }
+
+    fn save_provider(&mut self) -> Result<(), String> {
+        self.sync_editor_profile();
+        let new_name = self.draft.friendly_name.trim();
+        if new_name.is_empty() {
+            return Err("Enter a provider name first.".to_string());
+        }
+        let overwrote_existing = self.persist_draft_to_registry(true)?;
+        log_launcher_event(format!(
+            "save_provider name='{}' kind='{}' workspace='{}' model='{}' prompt_len={} profiles={}",
+            self.draft.friendly_name,
+            self.draft.provider_kind.label(),
+            self.draft.workspace.display(),
+            self.draft.model,
+            self.draft.prompt.len(),
+            self.state.profiles.len()
+        ));
+        self.status = if overwrote_existing {
+            format!(
+                "Updated provider '{}' in HKCU\\{}.",
+                self.draft.friendly_name, REGISTRY_PATH
+            )
+        } else {
+            format!(
+                "Saved provider '{}' to HKCU\\{}.",
+                self.draft.friendly_name, REGISTRY_PATH
+            )
+        };
+        Ok(())
+    }
+
+    fn delete_provider(&mut self) -> Result<(), String> {
+        let Some(index) = self.current_profile_index() else {
+            return Err("Select a saved provider to delete.".to_string());
+        };
+        let removed_name = self.state.profiles[index].friendly_name.clone();
+        self.state.profiles.remove(index);
+        if let Some(next) = self.state.profiles.first() {
+            self.selected_provider = next.friendly_name.clone();
+            self.state.last_selected = Some(next.friendly_name.clone());
+            self.load_selected_provider();
+        } else {
+            self.selected_provider = NEW_PROVIDER_KEY.to_string();
+            self.state.last_selected = None;
+            self.set_editor_profile(ProviderProfile::default());
+            self.refresh_models_with_status(false);
+        }
+        save_launcher_state(&self.state)?;
+        if self.draft.workspace.is_dir() {
+            let _ =
+                write_launch_profile(&self.draft, self.selected_token_limit(), Some(&self.state));
+        }
+        self.status = format!("Deleted provider '{removed_name}'.");
+        Ok(())
+    }
+
+    fn launch(&mut self, ctx: &egui::Context) -> Result<(), String> {
+        self.sync_editor_profile();
+        ensure_runtime_available()?;
+        if !self.claw_path.is_file() {
+            return Err(format!("Missing {}", self.claw_path.display()));
+        }
+        if self.draft.workspace.as_os_str().is_empty() || !self.draft.workspace.is_dir() {
+            return Err(format!(
+                "Workspace does not exist: {}",
+                self.draft.workspace.display()
+            ));
+        }
+        if self.draft.provider_kind.requires_api_key() && self.draft.api_key.trim().is_empty() {
+            return Err(format!(
+                "Enter an API key for '{}' before launching.",
+                self.draft.friendly_name
+            ));
+        }
+        if self.draft.model.trim().is_empty() {
+            return Err("Choose a model before launching.".to_string());
+        }
+        self.persist_draft_to_registry(false)?;
+        let launch_profile = self
+            .state
+            .profiles
+            .iter()
+            .find(|profile| profile.friendly_name == self.selected_provider)
+            .cloned()
+            .unwrap_or_else(|| self.draft.clone());
+
+        let user_profile = std::env::var("USERPROFILE")
+            .map_err(|_| "USERPROFILE is not set on this machine.".to_string())?;
+
+        let mut claw_command = format!(
+            "& '{}' --model '{}' --permission-mode '{}'",
+            powershell_escape(&self.claw_path.display().to_string()),
+            powershell_escape(&launch_profile.model),
+            powershell_escape(&launch_profile.permission_mode)
+        );
+        if !launch_profile.allowed_tools.is_empty() {
+            claw_command.push_str(&format!(
+                " --allowedTools '{}'",
+                powershell_escape(&launch_profile.allowed_tools.join(","))
+            ));
+        }
+        for arg in &launch_profile.args {
+            claw_command.push_str(&format!(" '{}'", powershell_escape(arg)));
+        }
+
+        let powershell_path = resolve_powershell_executable();
+        log_launcher_event(format!(
+            "launch selected='{}' profile='{}' workspace='{}' powershell='{}' claw='{}' model='{}'",
+            self.selected_provider,
+            launch_profile.friendly_name,
+            launch_profile.workspace.display(),
+            powershell_path.display(),
+            self.claw_path.display(),
+            launch_profile.model
+        ));
+
+        let mut command = Command::new(&powershell_path);
+        command.current_dir(&launch_profile.workspace);
+        command.arg("-NoLogo");
+        if launch_profile.keep_open {
+            command.arg("-NoExit");
+        }
+        command.arg("-Command").arg(claw_command);
+        if !launch_profile.prompt.trim().is_empty() {
+            command.env(LAUNCH_PROMPT_ENV_VAR, launch_profile.prompt.clone());
+        }
+        command.env("HOME", user_profile);
+        for (key, value) in launch_env_vars(&launch_profile) {
+            command.env(key, value);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(CREATE_NEW_CONSOLE);
+        }
+        command.spawn().map_err(|error| {
+            let message = format!(
+                "failed to start {} via {}: {}",
+                self.claw_path.display(),
+                powershell_path.display(),
+                error
+            );
+            log_launcher_event(format!("launch_error {}", message));
+            message
+        })?;
+        self.status = if self.draft.prompt.trim().is_empty() {
+            format!(
+                "Launching '{}' in {}...",
+                launch_profile.friendly_name,
+                launch_profile.workspace.display()
+            )
+        } else {
+            format!(
+                "Launching '{}' in {}... the prompt will be sent as the first command.",
+                launch_profile.friendly_name,
+                launch_profile.workspace.display()
+            )
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        Ok(())
+    }
+
+    fn persist_draft_to_registry(&mut self, require_name: bool) -> Result<bool, String> {
+        let resolved_name = self.draft.friendly_name.trim();
+        if require_name && resolved_name.is_empty() {
+            return Err("Enter a provider name first.".to_string());
+        }
+
+        if resolved_name.is_empty() {
+            let fallback_name = if self.selected_provider != NEW_PROVIDER_KEY
+                && !self.selected_provider.trim().is_empty()
+            {
+                self.selected_provider.trim().to_string()
+            } else {
+                self.draft.provider_kind.label().to_string()
+            };
+            self.draft.friendly_name = fallback_name;
+        } else {
+            self.draft.friendly_name = resolved_name.to_string();
+        }
+
+        let current_index = self.current_profile_index();
+        let existing_index = self
+            .state
+            .profiles
+            .iter()
+            .enumerate()
+            .find_map(|(index, profile)| {
+                (profile.friendly_name == self.draft.friendly_name && Some(index) != current_index)
+                    .then_some(index)
+            });
+
+        let overwrote_existing = current_index.is_some() || existing_index.is_some();
+        match current_index.or(existing_index) {
+            Some(index) => self.state.profiles[index] = self.draft.clone(),
+            None => self.state.profiles.push(self.draft.clone()),
+        }
+        self.state
+            .profiles
+            .sort_by(|left, right| left.friendly_name.cmp(&right.friendly_name));
+        self.state.last_selected = Some(self.draft.friendly_name.clone());
+        self.selected_provider = self.draft.friendly_name.clone();
+        save_launcher_state(&self.state)?;
+        if self.draft.workspace.is_dir() {
+            write_launch_profile(&self.draft, self.selected_token_limit(), Some(&self.state))?;
+        }
+        Ok(overwrote_existing)
+    }
+
+    fn context_estimate(&self) -> Option<(u32, u32, u32)> {
+        let model = self.selected_model()?;
+        let tool_cost = available_tools()
+            .iter()
+            .filter(|tool| self.selected_tools.contains(tool.id))
+            .map(|tool| tool.estimated_tokens)
+            .sum::<u32>();
+        let reserved_output = model.max_output_tokens.min(4_096);
+        let used = SYSTEM_PROMPT_ESTIMATE + BASE_REQUEST_OVERHEAD + tool_cost + reserved_output;
+        let remaining = model.context_window.saturating_sub(used);
+        Some((remaining, used, model.context_window))
+    }
+}
+
+impl eframe::App for LauncherApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Claw Launcher");
+            ui.label("Save reusable provider profiles, switch between them, and launch Claw with the matching workspace, model, and tools.");
+            ui.separator();
+
+            ui.group(|ui| {
+                ui.heading("Provider");
+                let previous_selection = self.selected_provider.clone();
+                ui.horizontal(|ui| {
+                    ui.label("Profile");
+                    egui::ComboBox::from_id_salt("provider-select")
+                        .selected_text(if self.selected_provider == NEW_PROVIDER_KEY {
+                            "New provider".to_string()
+                        } else {
+                            self.selected_provider.clone()
+                        })
+                        .width(260.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.selected_provider,
+                                NEW_PROVIDER_KEY.to_string(),
+                                "New provider",
+                            );
+                            for profile in &self.state.profiles {
+                                ui.selectable_value(
+                                    &mut self.selected_provider,
+                                    profile.friendly_name.clone(),
+                                    profile.friendly_name.clone(),
+                                );
+                            }
+                        });
+                    if ui.button("Save Provider").clicked() {
+                        if let Err(error) = self.save_provider() {
+                            self.status = error;
+                        }
+                    }
+                    if ui
+                        .add_enabled(
+                            self.current_profile_index().is_some(),
+                            egui::Button::new("Delete Provider"),
+                        )
+                        .clicked()
+                    {
+                        if let Err(error) = self.delete_provider() {
+                            self.status = error;
+                        }
+                    }
+                });
+                if self.selected_provider != previous_selection {
+                    self.load_selected_provider();
+                    self.status = if self.selected_provider == NEW_PROVIDER_KEY {
+                        "Creating a new provider profile.".to_string()
+                    } else {
+                        format!("Loaded provider '{}'.", self.selected_provider)
+                    };
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label("Provider name");
+                    ui.add(
+                        TextEdit::singleline(&mut self.draft.friendly_name).desired_width(260.0),
+                    );
+                    ui.label("Type");
+                    let previous_kind = self.draft.provider_kind;
+                    egui::ComboBox::from_id_salt("provider-kind")
+                        .selected_text(self.draft.provider_kind.label())
+                        .show_ui(ui, |ui| {
+                            for kind in ProviderKind::all() {
+                                ui.selectable_value(
+                                    &mut self.draft.provider_kind,
+                                    kind,
+                                    kind.label(),
+                                );
+                            }
+                        });
+                    if self.draft.provider_kind != previous_kind {
+                        self.draft.api_key.clear();
+                        if let Some(preset) = provider_presets()
+                            .into_iter()
+                            .find(|preset| preset.kind == self.draft.provider_kind)
+                        {
+                            self.draft.base_url = preset.base_url.to_string();
+                            self.draft.model = preset.model.to_string();
+                        }
+                        self.refresh_models_with_status(true);
+                    }
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Quick start");
+                    for preset in provider_presets() {
+                        let is_selected = self.draft.provider_kind == preset.kind;
+                        let button = if is_selected {
+                            egui::Button::new(preset.name)
+                                .fill(Color32::from_rgb(46, 160, 67))
+                                .stroke(egui::Stroke::new(1.0, Color32::from_rgb(24, 100, 45)))
+                        } else {
+                            egui::Button::new(preset.name)
+                        };
+                        if ui.add(button).clicked() {
+                            self.apply_preset(preset);
+                        }
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("API key");
+                    ui.add(
+                        TextEdit::singleline(&mut self.draft.api_key)
+                            .password(true)
+                            .desired_width(420.0),
+                    );
+                    let needs_api_key =
+                        self.draft.provider_kind.requires_api_key() && self.draft.api_key.trim().is_empty();
+                    let action_label = if needs_api_key {
+                        "Get API Key"
+                    } else {
+                        "Refresh Models"
+                    };
+                    if ui.button(action_label).clicked() {
+                        if needs_api_key {
+                            self.open_api_key_site();
+                        } else {
+                            self.refresh_models_with_status(true);
+                        }
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Base URL");
+                    ui.add(TextEdit::singleline(&mut self.draft.base_url).desired_width(420.0));
+                });
+
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.draft.respect_rate_limits, "Respect rate limits");
+                    if ui.button("Clear credentials").clicked() {
+                        self.draft.api_key.clear();
+                        self.status = "Cleared API key.".to_string();
+                    }
+                    if ui.button("Fetch rate limits").clicked() {
+                        self.status = "Fetching rate limits...".to_string();
+                    }
+                });
+            });
+
+            ui.add_space(8.0);
+            ui.group(|ui| {
+                ui.heading("Workspace And Launch");
+                ui.horizontal(|ui| {
+                    ui.label("Workspace");
+                    let mut workspace_display = self.draft.workspace.display().to_string();
+                    ui.add_enabled(
+                        false,
+                        TextEdit::singleline(&mut workspace_display).desired_width(420.0),
+                    );
+                    if ui.button("Select Folder").clicked() {
+                        if let Some(folder) = rfd::FileDialog::new()
+                            .set_directory(&self.draft.workspace)
+                            .pick_folder()
+                        {
+                            self.draft.workspace = folder;
+                        }
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Permission");
+                    egui::ComboBox::from_id_salt("permission-mode")
+                        .selected_text(self.draft.permission_mode.clone())
+                        .show_ui(ui, |ui| {
+                            for mode in ["danger-full-access", "workspace-write", "read-only"] {
+                                ui.selectable_value(
+                                    &mut self.draft.permission_mode,
+                                    mode.to_string(),
+                                    mode,
+                                );
+                            }
+                        });
+                    ui.checkbox(&mut self.draft.keep_open, "Keep terminal open");
+                });
+
+                ui.label("Prompt");
+                ui.add(
+                    TextEdit::multiline(&mut self.draft.prompt)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(3),
+                );
+
+                ui.label("Extra args (one per line)");
+                ui.add(
+                    TextEdit::multiline(&mut self.args_text)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(2),
+                );
+            });
+
+            ui.add_space(8.0);
+            ui.group(|ui| {
+                ui.heading("Model And Tools");
+                ui.horizontal(|ui| {
+                    ui.label("Search");
+                    let search_response = ui.add(
+                        TextEdit::singleline(&mut self.model_search_filter).desired_width(280.0),
+                    );
+                    if ui.button("Search").clicked() {
+                        self.apply_model_search();
+                    }
+                    if search_response.changed() {
+                        self.apply_model_search();
+                    }
+                    let filtered_models = self.filtered_models();
+                    let mut newly_selected_model = None;
+                    egui::ComboBox::from_id_salt("model-select")
+                        .selected_text(if self.model_search_filter.trim().is_empty() {
+                            "Choose known model".to_string()
+                        } else {
+                            format!("Choose known model ({})", filtered_models.len())
+                        })
+                        .width(260.0)
+                        .show_ui(ui, |ui| {
+                            for model in filtered_models {
+                                let text = format!(
+                                    "{}  [{} ctx / {} out{}]",
+                                    model.id,
+                                    model.context_window,
+                                    model.max_output_tokens,
+                                    if model.tool_use_supported {
+                                        ", tool use"
+                                    } else {
+                                        ", no tool use"
+                                    }
+                                );
+                                if ui.selectable_label(false, text).clicked() {
+                                    newly_selected_model = Some(model.id.clone());
+                                }
+                            }
+                        });
+                    if let Some(model_id) = newly_selected_model {
+                        self.draft.model = model_id;
+                        self.sanitize_selected_tools();
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Model");
+                    let model_response =
+                        ui.add(TextEdit::singleline(&mut self.draft.model).desired_width(280.0));
+                    if model_response.changed() {
+                        self.sanitize_selected_tools();
+                    }
+                });
+
+                if let Some(model) = self.selected_model() {
+                    ui.label(format!(
+                        "Model details: {} | context {} | max output {} | {}{}",
+                        model.label,
+                        model.context_window,
+                        model.max_output_tokens,
+                        if model.tool_use_supported {
+                            "tool use supported"
+                        } else {
+                            "tool use not supported"
+                        },
+                        if model.from_api {
+                            " | listed by provider API"
+                        } else {
+                            " | bundled metadata"
+                        }
+                    ));
+                }
+
+                ui.separator();
+                ui.label("Available tools");
+                let tool_options = self.available_tool_options();
+                if tool_options.is_empty() {
+                    ui.small("The selected model does not advertise tool support for this provider.");
+                } else {
+                    for tool in tool_options {
+                        let mut checked = self.selected_tools.contains(tool.id);
+                        let text = format!("{} ({})", tool.label, tool.description);
+                        if ui.checkbox(&mut checked, text).changed() {
+                            if checked {
+                                self.selected_tools.insert(tool.id.to_string());
+                            } else {
+                                self.selected_tools.remove(tool.id);
+                            }
+                        }
+                    }
+                }
+
+                if let Some((remaining, used, total)) = self.context_estimate() {
+                    let ratio = if total == 0 {
+                        0.0
+                    } else {
+                        remaining as f32 / total as f32
+                    };
+                    let (label, color) = if ratio > 0.55 {
+                        ("Green", Color32::from_rgb(46, 160, 67))
+                    } else if ratio > 0.30 {
+                        ("Amber", Color32::from_rgb(210, 153, 34))
+                    } else {
+                        ("Red", Color32::from_rgb(215, 58, 73))
+                    };
+                    ui.separator();
+                    ui.label(
+                        RichText::new(format!(
+                            "Estimated context headroom: {} tokens free of {} total ({} used). Indicator: {}",
+                            remaining, total, used, label
+                        ))
+                        .color(color),
+                    );
+                }
+            });
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Save Provider").clicked() {
+                    if let Err(error) = self.save_provider() {
+                        self.status = error;
+                    }
+                }
+                if ui.button("Launch").clicked() {
+                    match self.save_provider().and_then(|_| self.launch(ctx)) {
+                        Ok(()) => {}
+                        Err(error) => self.status = error,
+                    }
+                }
+            });
+
+            ui.separator();
+            ui.label(&self.status);
+            ui.small(format!("Provider registry: HKCU\\{}", REGISTRY_PATH));
+            ui.small(format!(
+                "Legacy config import source: {}",
+                self.legacy_config_path.display()
+            ));
+            ui.small(format!("Launcher directory: {}", self.exe_dir.display()));
+        });
+    }
+}
+
+fn load_launcher_window_icon() -> Arc<IconData> {
+    let icon_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("..")
+        .join("assets")
+        .join("openclaw.ico");
+    let icon = fs::read(icon_path)
+        .ok()
+        .and_then(|bytes| image::load_from_memory(&bytes).ok())
+        .map(|image| {
+            let rgba = image.into_rgba8();
+            let (width, height) = rgba.dimensions();
+            IconData {
+                rgba: rgba.into_raw(),
+                width,
+                height,
+            }
+        })
+        .unwrap_or_default();
+    Arc::new(icon)
+}
+
+fn default_workspace() -> PathBuf {
+    std::env::current_dir()
+        .or_else(|_| current_exe_dir())
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn provider_presets() -> [ProviderPreset; 4] {
+    [
+        ProviderPreset {
+            kind: ProviderKind::Groq,
+            name: "Groq",
+            base_url: "https://api.groq.com/openai/v1",
+            model: "llama-3.3-70b-versatile",
+        },
+        ProviderPreset {
+            kind: ProviderKind::OpenRouter,
+            name: "OpenRouter",
+            base_url: "https://openrouter.ai/api/v1",
+            model: "openai/gpt-oss-120b",
+        },
+        ProviderPreset {
+            kind: ProviderKind::GoogleAiStudio,
+            name: "Google AI Studio",
+            base_url: "https://generativelanguage.googleapis.com/v1beta",
+            model: "gemini-2.0-flash",
+        },
+        ProviderPreset {
+            kind: ProviderKind::Custom,
+            name: "Custom",
+            base_url: "",
+            model: "",
+        },
+    ]
+}
+
+fn starter_profiles() -> Vec<ProviderProfile> {
+    provider_presets()
+        .into_iter()
+        .map(ProviderProfile::from_preset)
+        .collect()
+}
+
+fn load_launcher_state(legacy_config_path: &Path) -> (LauncherState, String) {
+    let sidecar_path = default_workspace().join(LAUNCH_PROFILE_FILE_NAME);
+    let registry_state = read_registry_state();
+    if let Some(state) = registry_state
+        .clone()
+        .map(|state| hydrate_state_from_sidecar(state, &sidecar_path))
+    {
+        log_launcher_event(format!(
+            "load_launcher_state source=registry path='{}' profiles={} last_selected='{}'",
+            sidecar_path.display(),
+            state.profiles.len(),
+            state.last_selected.clone().unwrap_or_default()
+        ));
+        return (
+            state,
+            "Loaded provider profiles from the registry.".to_string(),
+        );
+    }
+    if let Some(state) = load_state_from_sidecar(&sidecar_path, None) {
+        log_launcher_event(format!(
+            "load_launcher_state source=sidecar path='{}' profiles={} last_selected='{}'",
+            sidecar_path.display(),
+            state.profiles.len(),
+            state.last_selected.clone().unwrap_or_default()
+        ));
+        return (
+            state,
+            format!("Loaded provider profiles from {}.", sidecar_path.display()),
+        );
+    }
+    if let Some(legacy) = load_legacy_config(legacy_config_path) {
+        let profile = ProviderProfile {
+            friendly_name: "Imported provider".to_string(),
+            provider_kind: ProviderKind::Custom,
+            api_key: legacy.openai_api_key,
+            base_url: legacy.openai_base_url,
+            workspace: legacy.workspace,
+            model: legacy.model,
+            permission_mode: legacy.permission_mode,
+            allowed_tools: legacy.allowed_tools,
+            keep_open: legacy.keep_open,
+            prompt: legacy.prompt.unwrap_or_default(),
+            args: legacy.args,
+            respect_rate_limits: true,
+        };
+        return (
+            LauncherState {
+                profiles: vec![profile],
+                last_selected: Some("Imported provider".to_string()),
+            },
+            "Imported the legacy launcher config. Save once to migrate it into the registry."
+                .to_string(),
+        );
+    }
+    (
+        LauncherState {
+            profiles: starter_profiles(),
+            last_selected: Some("Groq".to_string()),
+        },
+        "Created starter provider profiles. Add your API key and workspace, then save.".to_string(),
+    )
+}
+
+fn read_registry_state() -> Option<LauncherState> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let key = hkcu.open_subkey(REGISTRY_PATH).ok()?;
+    let body: String = key.get_value(REGISTRY_STATE_VALUE).ok()?;
+    let parsed = serde_json::from_str(&body).ok();
+    log_launcher_event(format!(
+        "read_registry_state success={} bytes={}",
+        parsed.is_some(),
+        body.len()
+    ));
+    parsed
+}
+
+fn load_state_from_sidecar(
+    path: &Path,
+    registry_state: Option<&LauncherState>,
+) -> Option<LauncherState> {
+    let body = fs::read_to_string(path).ok()?;
+    let sidecar = serde_json::from_str::<LaunchProfileFile>(&body).ok()?;
+
+    let merged_profiles = if let Some(profiles) = sidecar.profiles.clone() {
+        profiles
+    } else if let Some(profile) = profile_from_sidecar(&sidecar, registry_state) {
+        vec![profile]
+    } else {
+        registry_state?.profiles.clone()
+    };
+
+    let last_selected = sidecar
+        .last_selected
+        .clone()
+        .or_else(|| sidecar.provider_name.clone())
+        .or_else(|| registry_state.and_then(|state| state.last_selected.clone()))
+        .or_else(|| {
+            merged_profiles
+                .first()
+                .map(|profile| profile.friendly_name.clone())
+        });
+
+    Some(LauncherState {
+        profiles: merge_profiles_with_registry(merged_profiles, registry_state),
+        last_selected,
+    })
+}
+
+fn hydrate_state_from_sidecar(mut state: LauncherState, path: &Path) -> LauncherState {
+    let Ok(body) = fs::read_to_string(path) else {
+        return state;
+    };
+    let Ok(sidecar) = serde_json::from_str::<LaunchProfileFile>(&body) else {
+        return state;
+    };
+
+    if let Some(last_selected) = sidecar
+        .last_selected
+        .clone()
+        .or_else(|| sidecar.provider_name.clone())
+    {
+        if state
+            .profiles
+            .iter()
+            .any(|profile| profile.friendly_name == last_selected)
+        {
+            state.last_selected = Some(last_selected);
+        }
+    }
+
+    if let Some(profile) = profile_from_sidecar(&sidecar, Some(&state)) {
+        if let Some(existing) = state
+            .profiles
+            .iter_mut()
+            .find(|candidate| candidate.friendly_name == profile.friendly_name)
+        {
+            *existing = merge_profile_with_registry_fallback(profile, existing.clone());
+        } else {
+            state.profiles.push(profile);
+            state
+                .profiles
+                .sort_by(|left, right| left.friendly_name.cmp(&right.friendly_name));
+        }
+    }
+
+    state
+}
+
+fn profile_from_sidecar(
+    sidecar: &LaunchProfileFile,
+    registry_state: Option<&LauncherState>,
+) -> Option<ProviderProfile> {
+    let name = sidecar
+        .provider_name
+        .clone()
+        .or_else(|| registry_state.and_then(|state| state.last_selected.clone()))?;
+    let fallback = registry_state.and_then(|state| {
+        state
+            .profiles
+            .iter()
+            .find(|profile| profile.friendly_name == name)
+            .cloned()
+    });
+    Some(ProviderProfile {
+        friendly_name: name,
+        provider_kind: sidecar
+            .provider_kind
+            .or_else(|| fallback.as_ref().map(|profile| profile.provider_kind))
+            .unwrap_or(ProviderKind::Custom),
+        api_key: sidecar
+            .api_key
+            .clone()
+            .or_else(|| fallback.as_ref().map(|profile| profile.api_key.clone()))
+            .unwrap_or_default(),
+        base_url: sidecar
+            .base_url
+            .clone()
+            .or_else(|| fallback.as_ref().map(|profile| profile.base_url.clone()))
+            .unwrap_or_default(),
+        workspace: sidecar
+            .workspace
+            .clone()
+            .or_else(|| fallback.as_ref().map(|profile| profile.workspace.clone()))
+            .unwrap_or_else(default_workspace),
+        model: sidecar
+            .model
+            .clone()
+            .or_else(|| fallback.as_ref().map(|profile| profile.model.clone()))
+            .unwrap_or_default(),
+        permission_mode: sidecar
+            .permission_mode
+            .clone()
+            .or_else(|| {
+                fallback
+                    .as_ref()
+                    .map(|profile| profile.permission_mode.clone())
+            })
+            .unwrap_or_else(|| "danger-full-access".to_string()),
+        allowed_tools: sidecar
+            .allowed_tools
+            .clone()
+            .or_else(|| {
+                fallback
+                    .as_ref()
+                    .map(|profile| profile.allowed_tools.clone())
+            })
+            .unwrap_or_default(),
+        keep_open: sidecar
+            .keep_open
+            .or_else(|| fallback.as_ref().map(|profile| profile.keep_open))
+            .unwrap_or(true),
+        prompt: sidecar
+            .prompt
+            .clone()
+            .or_else(|| fallback.as_ref().map(|profile| profile.prompt.clone()))
+            .unwrap_or_default(),
+        args: sidecar
+            .args
+            .clone()
+            .or_else(|| fallback.as_ref().map(|profile| profile.args.clone()))
+            .unwrap_or_default(),
+        respect_rate_limits: sidecar
+            .respect_rate_limits
+            .or_else(|| fallback.as_ref().map(|profile| profile.respect_rate_limits))
+            .unwrap_or(true),
+    })
+}
+
+fn merge_profiles_with_registry(
+    sidecar_profiles: Vec<ProviderProfile>,
+    registry_state: Option<&LauncherState>,
+) -> Vec<ProviderProfile> {
+    let Some(registry_state) = registry_state else {
+        return sidecar_profiles;
+    };
+    sidecar_profiles
+        .into_iter()
+        .map(|profile| {
+            let Some(registry_profile) = registry_state
+                .profiles
+                .iter()
+                .find(|candidate| candidate.friendly_name == profile.friendly_name)
+            else {
+                return profile;
+            };
+            merge_profile_with_registry_fallback(profile, registry_profile.clone())
+        })
+        .collect()
+}
+
+fn merge_profile_with_registry_fallback(
+    profile: ProviderProfile,
+    registry_profile: ProviderProfile,
+) -> ProviderProfile {
+    ProviderProfile {
+        friendly_name: profile.friendly_name,
+        provider_kind: profile.provider_kind,
+        api_key: if profile.api_key.trim().is_empty() {
+            registry_profile.api_key
+        } else {
+            profile.api_key
+        },
+        base_url: if profile.base_url.trim().is_empty() {
+            registry_profile.base_url
+        } else {
+            profile.base_url
+        },
+        workspace: if profile.workspace.as_os_str().is_empty() {
+            registry_profile.workspace
+        } else {
+            profile.workspace
+        },
+        model: if profile.model.trim().is_empty() {
+            registry_profile.model
+        } else {
+            profile.model
+        },
+        permission_mode: if profile.permission_mode.trim().is_empty() {
+            registry_profile.permission_mode
+        } else {
+            profile.permission_mode
+        },
+        allowed_tools: if profile.allowed_tools.is_empty() {
+            registry_profile.allowed_tools
+        } else {
+            profile.allowed_tools
+        },
+        keep_open: profile.keep_open,
+        prompt: if profile.prompt.trim().is_empty() {
+            registry_profile.prompt
+        } else {
+            profile.prompt
+        },
+        args: if profile.args.is_empty() {
+            registry_profile.args
+        } else {
+            profile.args
+        },
+        respect_rate_limits: profile.respect_rate_limits,
+    }
+}
+
+fn save_launcher_state(state: &LauncherState) -> Result<(), String> {
+    let body = serde_json::to_string_pretty(state)
+        .map_err(|error| format!("failed to serialize launcher state: {error}"))?;
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (key, _) = hkcu
+        .create_subkey(REGISTRY_PATH)
+        .map_err(|error| format!("failed to open HKCU\\{}: {error}", REGISTRY_PATH))?;
+    key.set_value(REGISTRY_STATE_VALUE, &body)
+        .map_err(|error| {
+            let message = format!("failed to write launcher state to the registry: {error}");
+            log_launcher_event(format!("save_launcher_state error={message}"));
+            message
+        })?;
+    log_launcher_event(format!(
+        "save_launcher_state profiles={} last_selected='{}' bytes={}",
+        state.profiles.len(),
+        state.last_selected.clone().unwrap_or_default(),
+        body.len()
+    ));
+    Ok(())
+}
+
+fn write_launch_profile(
+    profile: &ProviderProfile,
+    token_limit: (u32, u32),
+    state: Option<&LauncherState>,
+) -> Result<(), String> {
+    let launch_profile = LaunchProfileFile {
+        provider_name: Some(profile.friendly_name.clone()),
+        provider_kind: Some(profile.provider_kind),
+        api_key: Some(profile.api_key.clone()),
+        model: Some(profile.model.clone()),
+        base_url: Some(profile.base_url.clone()),
+        workspace: Some(profile.workspace.clone()),
+        permission_mode: Some(profile.permission_mode.clone()),
+        allowed_tools: Some(profile.allowed_tools.clone()),
+        keep_open: Some(profile.keep_open),
+        prompt: Some(profile.prompt.clone()),
+        args: Some(profile.args.clone()),
+        context_window_tokens: Some(token_limit.0),
+        max_output_tokens: Some(token_limit.1),
+        respect_rate_limits: Some(profile.respect_rate_limits),
+        profiles: state.map(|state| state.profiles.clone()),
+        last_selected: Some(profile.friendly_name.clone()),
+    };
+    let body = serde_json::to_string_pretty(&launch_profile)
+        .map_err(|error| format!("failed to serialize launch profile: {error}"))?;
+    let path = profile.workspace.join(LAUNCH_PROFILE_FILE_NAME);
+    fs::write(&path, body).map_err(|error| format!("failed to write {}: {error}", path.display()))
+}
+
+fn load_legacy_config(path: &Path) -> Option<LegacyLauncherConfig> {
+    let body = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&body).ok()
+}
+
+fn current_exe_dir() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|error| format!("current_exe failed: {error}"))?;
+    exe.parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| format!("failed to resolve parent directory for {}", exe.display()))
+}
+
+fn launcher_log_path() -> Option<PathBuf> {
+    current_exe_dir()
+        .ok()
+        .map(|dir| dir.join(LAUNCHER_LOG_FILE_NAME))
+}
+
+fn log_launcher_event(message: impl AsRef<str>) {
+    let Some(path) = launcher_log_path() else {
+        return;
+    };
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "[{timestamp}] {}", message.as_ref());
+    }
+}
+
+fn resolve_powershell_executable() -> PathBuf {
+    if let Some(windir) = std::env::var_os("WINDIR") {
+        let candidate = PathBuf::from(windir)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from("powershell.exe")
+}
+
+fn ensure_runtime_available() -> Result<(), String> {
+    let required = ["VCRUNTIME140.dll", "ucrtbase.dll"];
+    let missing = required
+        .into_iter()
+        .filter(|dll| !can_find_runtime_dll(dll))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let _ = webbrowser::open(VC_REDIST_URL);
+    Err(format!(
+        "Missing Windows runtime component(s): {}. Opened the Microsoft VC++ redistributable download page.",
+        missing.join(", ")
+    ))
+}
+
+fn can_find_runtime_dll(name: &str) -> bool {
+    let Some(windir) = std::env::var_os("WINDIR").map(PathBuf::from) else {
+        return false;
+    };
+    ["System32", "SysWOW64"]
+        .into_iter()
+        .any(|folder| windir.join(folder).join(name).is_file())
+}
+
+fn launch_env_vars(profile: &ProviderProfile) -> Vec<(&'static str, String)> {
+    let mut vars = vec![
+        ("CLAW_MODEL", profile.model.clone()),
+        ("CLAW_PROVIDER_NAME", profile.friendly_name.clone()),
+        (
+            "CLAW_RESPECT_RATE_LIMITS",
+            profile.respect_rate_limits.to_string(),
+        ),
+    ];
+    match profile.provider_kind {
+        ProviderKind::GoogleAiStudio => {
+            vars.push(("GOOGLE_API_KEY", profile.api_key.clone()));
+            vars.push(("GOOGLE_BASE_URL", profile.base_url.clone()));
+        }
+        _ => {
+            vars.push(("OPENAI_API_KEY", profile.api_key.clone()));
+            vars.push(("OPENAI_BASE_URL", profile.base_url.clone()));
+        }
+    }
+    vars
+}
+
+fn provider_default_token_limit(provider_kind: ProviderKind) -> (u32, u32) {
+    match provider_kind {
+        ProviderKind::Groq => (131_072, 8_192),
+        ProviderKind::OpenRouter => (131_072, 16_384),
+        ProviderKind::GoogleAiStudio => (131_072, 16_384),
+        ProviderKind::Custom => (131_072, 16_384),
+    }
+}
+
+fn available_tools() -> Vec<ToolOption> {
+    vec![
+        ToolOption {
+            id: "read",
+            label: "read",
+            description: "Read files",
+            estimated_tokens: 450,
+        },
+        ToolOption {
+            id: "glob",
+            label: "glob",
+            description: "Find files by pattern",
+            estimated_tokens: 250,
+        },
+        ToolOption {
+            id: "grep",
+            label: "grep",
+            description: "Search file contents",
+            estimated_tokens: 350,
+        },
+        ToolOption {
+            id: "write",
+            label: "write",
+            description: "Write files",
+            estimated_tokens: 450,
+        },
+        ToolOption {
+            id: "edit",
+            label: "edit",
+            description: "Edit files",
+            estimated_tokens: 450,
+        },
+        ToolOption {
+            id: "bash",
+            label: "bash",
+            description: "Run shell commands",
+            estimated_tokens: 700,
+        },
+    ]
+}
+
+fn known_models() -> Vec<KnownModel> {
+    vec![
+        KnownModel {
+            id: "llama-3.3-70b-versatile",
+            label: "Llama 3.3 70B Versatile",
+            context_window: 131_072,
+            max_output_tokens: 32_768,
+            tool_use_supported: true,
+        },
+        KnownModel {
+            id: "openai/gpt-oss-120b",
+            label: "GPT-OSS 120B",
+            context_window: 131_072,
+            max_output_tokens: 65_536,
+            tool_use_supported: true,
+        },
+        KnownModel {
+            id: "openai/gpt-oss-20b",
+            label: "GPT-OSS 20B",
+            context_window: 131_072,
+            max_output_tokens: 65_536,
+            tool_use_supported: true,
+        },
+        KnownModel {
+            id: "qwen/qwen3-32b",
+            label: "Qwen 3 32B",
+            context_window: 131_072,
+            max_output_tokens: 16_384,
+            tool_use_supported: true,
+        },
+        KnownModel {
+            id: "meta-llama/llama-4-scout-17b-16e-instruct",
+            label: "Llama 4 Scout 17B",
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+            tool_use_supported: true,
+        },
+        KnownModel {
+            id: "groq/compound",
+            label: "Compound",
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+            tool_use_supported: false,
+        },
+        KnownModel {
+            id: "gemini-2.0-flash",
+            label: "Gemini 2.0 Flash",
+            context_window: 1_048_576,
+            max_output_tokens: 8_192,
+            tool_use_supported: true,
+        },
+        KnownModel {
+            id: "gemini-2.0-flash-lite",
+            label: "Gemini 2.0 Flash-Lite",
+            context_window: 1_048_576,
+            max_output_tokens: 8_192,
+            tool_use_supported: true,
+        },
+        KnownModel {
+            id: "gpt-4.1-mini",
+            label: "GPT-4.1 Mini",
+            context_window: 1_047_576,
+            max_output_tokens: 32_768,
+            tool_use_supported: true,
+        },
+        KnownModel {
+            id: "gpt-4.1",
+            label: "GPT-4.1",
+            context_window: 1_047_576,
+            max_output_tokens: 32_768,
+            tool_use_supported: true,
+        },
+        KnownModel {
+            id: "grok-3-mini",
+            label: "Grok 3 Mini",
+            context_window: 131_072,
+            max_output_tokens: 16_384,
+            tool_use_supported: true,
+        },
+        KnownModel {
+            id: "claude-sonnet-4-5",
+            label: "Claude Sonnet 4.5",
+            context_window: 200_000,
+            max_output_tokens: 8_192,
+            tool_use_supported: true,
+        },
+        KnownModel {
+            id: LEGACY_DEFAULT_MODEL,
+            label: "Legacy Default",
+            context_window: 131_072,
+            max_output_tokens: 32_768,
+            tool_use_supported: true,
+        },
+    ]
+}
+
+fn initial_models(provider_kind: ProviderKind, base_url: &str, api_key: &str) -> Vec<ModelView> {
+    let mut by_id = known_models()
+        .into_iter()
+        .filter(model_is_applicable)
+        .filter(|model| model_matches_provider(model.id, provider_kind))
+        .map(|model| {
+            (
+                model.id.to_string(),
+                ModelView {
+                    id: model.id.to_string(),
+                    label: model.label.to_string(),
+                    context_window: model.context_window,
+                    max_output_tokens: model.max_output_tokens,
+                    tool_use_supported: model.tool_use_supported,
+                    from_api: false,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    if provider_kind.supports_remote_models() {
+        if let Ok(remote_models) = fetch_models(provider_kind, base_url, api_key) {
+            for remote_model in remote_models {
+                if !model_matches_provider(&remote_model.id, provider_kind)
+                    || !remote_model_is_applicable(&remote_model.id)
+                {
+                    continue;
+                }
+                let entry = by_id
+                    .entry(remote_model.id.clone())
+                    .or_insert_with(|| ModelView {
+                        id: remote_model.id.clone(),
+                        label: known_model_label(&remote_model.id)
+                            .unwrap_or_else(|| remote_model.id.clone()),
+                        context_window: known_model_context_window(&remote_model.id)
+                            .unwrap_or(131_072),
+                        max_output_tokens: known_model_max_output_tokens(&remote_model.id)
+                            .unwrap_or(8_192),
+                        tool_use_supported: true,
+                        from_api: true,
+                    });
+                entry.from_api = true;
+            }
+        }
+    }
+
+    let mut models = by_id.into_values().collect::<Vec<_>>();
+    models.sort_by(|left, right| left.id.cmp(&right.id));
+    models
+}
+
+fn fetch_models(
+    provider_kind: ProviderKind,
+    base_url: &str,
+    api_key: &str,
+) -> Result<Vec<OpenAiCompatModel>, String> {
+    if !provider_kind.supports_remote_models() {
+        return Err("provider does not expose a compatible /models endpoint".to_string());
+    }
+    let trimmed_url = base_url.trim();
+    if trimmed_url.is_empty() {
+        return Err("base URL is empty".to_string());
+    }
+    if provider_kind.requires_api_key() && api_key.trim().is_empty() {
+        return Err("API key is empty".to_string());
+    }
+
+    let client = Client::builder()
+        .build()
+        .map_err(|error| format!("http client build failed: {error}"))?;
+    let mut request = client.get(format!("{}/models", trimmed_url.trim_end_matches('/')));
+    if provider_kind.requires_api_key() {
+        request = request.bearer_auth(api_key.trim());
+    }
+    let response = request
+        .send()
+        .map_err(|error| format!("failed to fetch models: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("models request failed with {}", response.status()));
+    }
+    response
+        .json::<OpenAiCompatModelList>()
+        .map(|payload| payload.data)
+        .map_err(|error| format!("failed to parse models response: {error}"))
+}
+
+fn model_matches_provider(model_id: &str, provider_kind: ProviderKind) -> bool {
+    let lowered = model_id.to_ascii_lowercase();
+    match provider_kind {
+        ProviderKind::Groq => {
+            matches!(
+                model_id,
+                "llama-3.3-70b-versatile"
+                    | "meta-llama/llama-4-scout-17b-16e-instruct"
+                    | "qwen/qwen3-32b"
+            ) || lowered.starts_with("llama-")
+                || lowered.starts_with("mixtral")
+                || lowered.starts_with("gemma")
+                || lowered.starts_with("qwen/")
+                || lowered.starts_with("meta-llama/")
+                || lowered.starts_with("moonshotai/")
+                || lowered.starts_with("deepseek-")
+        }
+        ProviderKind::OpenRouter => lowered.contains('/'),
+        ProviderKind::GoogleAiStudio => lowered.starts_with("gemini-"),
+        ProviderKind::Custom => true,
+    }
+}
+
+fn model_is_applicable(model: &KnownModel) -> bool {
+    model.tool_use_supported && model.id != LEGACY_DEFAULT_MODEL
+}
+
+fn remote_model_is_applicable(model_id: &str) -> bool {
+    !model_id.trim().is_empty()
+}
+
+fn known_model_label(model_id: &str) -> Option<String> {
+    known_models()
+        .into_iter()
+        .find(|model| model.id == model_id)
+        .map(|model| model.label.to_string())
+}
+
+fn known_model_context_window(model_id: &str) -> Option<u32> {
+    known_models()
+        .into_iter()
+        .find(|model| model.id == model_id)
+        .map(|model| model.context_window)
+}
+
+fn known_model_max_output_tokens(model_id: &str) -> Option<u32> {
+    known_models()
+        .into_iter()
+        .find(|model| model.id == model_id)
+        .map(|model| model.max_output_tokens)
+}
+
+fn powershell_escape(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn cwd_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn default_workspace_uses_current_directory() {
+        let _guard = cwd_lock();
+        let root = std::env::temp_dir().join(format!(
+            "claw-launcher-default-workspace-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("workspace fixture");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("switch cwd");
+
+        assert_eq!(default_workspace(), root);
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+}

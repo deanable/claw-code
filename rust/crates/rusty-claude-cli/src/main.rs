@@ -78,6 +78,7 @@ const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
+const LAUNCH_PROMPT_ENV_VAR: &str = "CLAW_LAUNCH_PROMPT";
 const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/claw-code";
 const OFFICIAL_REPO_SLUG: &str = "ultraworkers/claw-code";
 const DEPRECATED_INSTALL_COMMAND: &str = "cargo install claw-code";
@@ -1119,6 +1120,7 @@ fn resolve_repl_model(cli_model: String) -> String {
 fn provider_label(kind: ProviderKind) -> &'static str {
     match kind {
         ProviderKind::Anthropic => "anthropic",
+        ProviderKind::GoogleAiStudio => "google-ai-studio",
         ProviderKind::Xai => "xai",
         ProviderKind::OpenAi => "openai",
     }
@@ -3061,6 +3063,10 @@ fn run_repl(
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
+    if let Some(startup_prompt) = launch_prompt_from_env() {
+        cli.record_prompt_history(&startup_prompt);
+        cli.run_turn(&startup_prompt)?;
+    }
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
@@ -3110,6 +3116,16 @@ fn run_repl(
     }
 
     Ok(())
+}
+
+fn launch_prompt_from_env() -> Option<String> {
+    let prompt = std::env::var(LAUNCH_PROMPT_ENV_VAR).ok()?;
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3770,12 +3786,14 @@ impl LiveCli {
                 Ok(())
             }
             Err(error) => {
-                runtime.shutdown_plugins()?;
+                let persisted = self.capture_failed_runtime(runtime);
                 spinner.fail(
                     "❌ Request failed",
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
+                self.print_failed_turn_resume_hint(persisted.as_ref().err());
+                persisted?;
                 Err(Box::new(error))
             }
         }
@@ -3799,7 +3817,15 @@ impl LiveCli {
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
-        let summary = result?;
+        let summary = match result {
+            Ok(summary) => summary,
+            Err(error) => {
+                let persisted = self.capture_failed_runtime(runtime);
+                self.print_failed_turn_resume_hint(persisted.as_ref().err());
+                persisted?;
+                return Err(Box::new(error));
+            }
+        };
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         let final_text = final_assistant_text(&summary);
@@ -3812,7 +3838,15 @@ impl LiveCli {
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
-        let summary = result?;
+        let summary = match result {
+            Ok(summary) => summary,
+            Err(error) => {
+                let persisted = self.capture_failed_runtime(runtime);
+                self.print_failed_turn_resume_hint(persisted.as_ref().err());
+                persisted?;
+                return Err(Box::new(error));
+            }
+        };
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         println!(
@@ -4021,6 +4055,31 @@ impl LiveCli {
     fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.runtime.session().save_to_path(&self.session.path)?;
         Ok(())
+    }
+
+    fn capture_failed_runtime(
+        &mut self,
+        runtime: BuiltRuntime,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.replace_runtime(runtime)?;
+        self.persist_session()
+    }
+
+    fn print_failed_turn_resume_hint(
+        &self,
+        persistence_error: Option<&Box<dyn std::error::Error>>,
+    ) {
+        eprintln!();
+        match persistence_error {
+            Some(error) => {
+                eprintln!("Session save failed {}", error);
+            }
+            None => {
+                eprintln!("Session saved      {}", self.session.path.display());
+                eprintln!("Resume             claw --resume {}", self.session.id);
+            }
+        }
+        eprintln!();
     }
 
     fn print_status(&self) {
@@ -6740,17 +6799,16 @@ impl AnthropicRuntimeClient {
                     .with_prompt_cache(PromptCache::new(session_id));
                 ApiProviderClient::Anthropic(inner)
             }
-            ProviderKind::Xai | ProviderKind::OpenAi => {
+            ProviderKind::GoogleAiStudio | ProviderKind::Xai | ProviderKind::OpenAi => {
                 // The api crate's `ProviderClient::from_model_with_anthropic_auth`
                 // with `None` for the anthropic auth routes via
                 // `detect_provider_kind` and builds an
-                // `OpenAiCompatClient::from_env` with the matching
-                // `OpenAiCompatConfig` (openai / xai / dashscope).
+                // provider client with the matching backend config
+                // (google / openai / xai / dashscope).
                 // That reads the correct API-key env var and BASE_URL
                 // override internally, so this one call covers OpenAI,
-                // OpenRouter, xAI, DashScope, Ollama, and any other
-                // OpenAI-compat endpoint users configure via
-                // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
+                // OpenRouter, Gemini, xAI, DashScope, Ollama, and any
+                // other configured backend users route to here.
                 ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
             }
         };
@@ -7014,6 +7072,8 @@ fn request_ends_with_tool_result(request: &ApiRequest) -> bool {
 fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> String {
     if error.is_context_window_failure() {
         format_context_window_blocked_error(session_id, error)
+    } else if is_provider_rate_limit_like(error) {
+        format_provider_rate_limit_error(session_id, error)
     } else if error.is_generic_fatal_wrapper() {
         let mut qualifiers = vec![format!("session {session_id}")];
         if let Some(request_id) = error.request_id() {
@@ -7100,6 +7160,73 @@ fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) 
     lines.push("  Retry            rerun after compacting or reducing the request".to_string());
 
     lines.join("\n")
+}
+
+fn is_provider_rate_limit_like(error: &api::ApiError) -> bool {
+    if error.safe_failure_class() == "provider_rate_limit" {
+        return true;
+    }
+    provider_error_detail(error)
+        .map(looks_like_quota_exhausted)
+        .unwrap_or(false)
+}
+
+fn format_provider_rate_limit_error(session_id: &str, error: &api::ApiError) -> String {
+    let mut lines = vec![
+        "Provider rate limited".to_string(),
+        "  Failure class    provider_rate_limit".to_string(),
+        format!("  Session          {session_id}"),
+    ];
+
+    if let Some(request_id) = error.request_id() {
+        lines.push(format!("  Trace            {request_id}"));
+    }
+
+    let detail = provider_error_detail(error);
+    if let Some(detail) = detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+    {
+        lines.push(format!(
+            "  Detail           {}",
+            truncate_for_summary(detail, 120)
+        ));
+        if looks_like_quota_exhausted(detail) {
+            lines.push("  Likely cause     provider quota exhausted".to_string());
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("Recovery".to_string());
+    lines.push(format!("  Resume later     claw --resume {session_id}"));
+    lines.push("  Retry            wait for quota/reset window, then rerun".to_string());
+    lines.push(
+        "  Reduce traffic   lower request frequency or switch to a higher quota tier".to_string(),
+    );
+
+    lines.join("\n")
+}
+
+fn provider_error_detail(error: &api::ApiError) -> Option<&str> {
+    match error {
+        api::ApiError::Api { message, body, .. } => Some(message.as_deref().unwrap_or(body)),
+        api::ApiError::RetriesExhausted { last_error, .. } => provider_error_detail(last_error),
+        _ => None,
+    }
+}
+
+fn looks_like_quota_exhausted(detail: &str) -> bool {
+    let lowered = detail.to_ascii_lowercase();
+    [
+        "quota",
+        "resource_exhausted",
+        "rate limit",
+        "exhausted",
+        "too many requests",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
 }
 
 fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
@@ -8295,8 +8422,8 @@ mod tests {
         summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
-        STUB_COMMANDS,
+        PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LAUNCH_PROMPT_ENV_VAR,
+        LATEST_SESSION_REFERENCE, STUB_COMMANDS, launch_prompt_from_env,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -8382,6 +8509,40 @@ mod tests {
         assert!(rendered.contains("provider_retry_exhausted"), "{rendered}");
         assert!(rendered.contains("session session-issue-22"));
         assert!(rendered.contains("trace req_jobdori_790"));
+    }
+
+    #[test]
+    fn provider_rate_limit_errors_render_resume_later_guidance() {
+        let error = ApiError::Api {
+            status: "429".parse().expect("status"),
+            error_type: Some("RESOURCE_EXHAUSTED".to_string()),
+            message: Some(
+                "Quota exceeded for quota metric GenerateContent requests per minute".to_string(),
+            ),
+            request_id: Some("req_quota_123".to_string()),
+            body: String::new(),
+            retryable: true,
+        };
+
+        let rendered = format_user_visible_api_error("session-rate-1", &error);
+        assert!(rendered.contains("Provider rate limited"), "{rendered}");
+        assert!(rendered.contains("provider_rate_limit"), "{rendered}");
+        assert!(
+            rendered.contains("Session          session-rate-1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Trace            req_quota_123"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Likely cause     provider quota exhausted"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Resume later     claw --resume session-rate-1"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -8521,6 +8682,25 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn launch_prompt_from_env_trims_and_ignores_empty_values() {
+        let _guard = env_lock();
+        std::env::remove_var(LAUNCH_PROMPT_ENV_VAR);
+
+        assert_eq!(launch_prompt_from_env(), None);
+
+        std::env::set_var(LAUNCH_PROMPT_ENV_VAR, "   ");
+        assert_eq!(launch_prompt_from_env(), None);
+
+        std::env::set_var(LAUNCH_PROMPT_ENV_VAR, "  first command  ");
+        assert_eq!(
+            launch_prompt_from_env().as_deref(),
+            Some("first command")
+        );
+
+        std::env::remove_var(LAUNCH_PROMPT_ENV_VAR);
     }
 
     fn with_current_dir<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {

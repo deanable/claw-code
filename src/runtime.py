@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import field
 
 from .commands import PORTED_COMMANDS
 from .context import PortContext, build_port_context, render_context
 from .history import HistoryLog
 from .models import PermissionDenial, PortingModule
 from .query_engine import QueryEngineConfig, QueryEnginePort, TurnResult
-from .setup import SetupReport, WorkspaceSetup, run_setup
+from .setup import SetupReport, WorkspaceSetup, build_workspace_setup, run_setup
 from .system_init import build_system_init_message
 from .tools import PORTED_TOOLS
 from .execution_registry import build_execution_registry
@@ -48,6 +49,7 @@ class RuntimeSession:
             '## Setup',
             f'- Python: {self.setup.python_version} ({self.setup.implementation})',
             f'- Platform: {self.setup.platform_name}',
+            f'- Shell policy: {self.setup.platform_profile.shell_guidance}',
             f'- Test command: {self.setup.test_command}',
             '',
             '## Startup Steps',
@@ -87,6 +89,8 @@ class RuntimeSession:
 
 
 class PortRuntime:
+    setup: WorkspaceSetup = field(default_factory=build_workspace_setup)
+
     def route_prompt(self, prompt: str, limit: int = 5) -> list[RoutedMatch]:
         tokens = {token.lower() for token in prompt.replace('/', ' ').replace('-', ' ').split() if token}
         by_kind = {
@@ -141,7 +145,7 @@ class PortRuntime:
             context=context,
             setup=setup,
             setup_report=setup_report,
-            system_init_message=build_system_init_message(trusted=True),
+            system_init_message=build_system_init_message(trusted=True, platform_name=setup.platform_name),
             history=history,
             routed_matches=matches,
             turn_result=turn_result,

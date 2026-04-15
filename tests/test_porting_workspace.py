@@ -9,7 +9,9 @@ from src.commands import PORTED_COMMANDS
 from src.parity_audit import run_parity_audit
 from src.port_manifest import build_port_manifest
 from src.query_engine import QueryEnginePort
+from src.setup import build_platform_profile
 from src.tools import PORTED_TOOLS
+from src.tools import get_tools
 
 
 class PortingWorkspaceTests(unittest.TestCase):
@@ -225,6 +227,28 @@ class PortingWorkspaceTests(unittest.TestCase):
         )
         self.assertIn('Deferred init:', result.stdout)
         self.assertIn('plugin_init=True', result.stdout)
+
+    def test_windows_platform_profile_prefers_powershell(self) -> None:
+        profile = build_platform_profile('Windows 11 Pro')
+        self.assertEqual(profile.family, 'windows')
+        self.assertEqual(profile.preferred_shell_tools, ('PowerShellTool',))
+        self.assertIn('PowerShellTool', profile.shell_guidance)
+
+    def test_tool_selection_is_platform_aware(self) -> None:
+        windows_tools = get_tools(platform_name='Windows 11 Pro')
+        linux_tools = get_tools(platform_name='Linux')
+        self.assertGreaterEqual(len(windows_tools), 1)
+        self.assertGreaterEqual(len(linux_tools), 1)
+        self.assertEqual(windows_tools[0].name, 'PowerShellTool')
+        self.assertEqual(linux_tools[0].name, 'BashTool')
+        self.assertLess(windows_tools.index(next(tool for tool in windows_tools if tool.name == 'PowerShellTool')), windows_tools.index(next(tool for tool in windows_tools if tool.name == 'BashTool')))
+
+    def test_simple_mode_prefers_platform_shell(self) -> None:
+        windows_tools = get_tools(simple_mode=True, platform_name='Windows 11 Pro')
+        linux_tools = get_tools(simple_mode=True, platform_name='Linux')
+        self.assertIn('PowerShellTool', [tool.name for tool in windows_tools])
+        self.assertNotIn('BashTool', [tool.name for tool in windows_tools])
+        self.assertIn('BashTool', [tool.name for tool in linux_tools])
 
     def test_execution_registry_runs(self) -> None:
         from src.execution_registry import build_execution_registry

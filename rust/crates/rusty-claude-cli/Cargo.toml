@@ -9,12 +9,20 @@ publish.workspace = true
 name = "claw"
 path = "src/main.rs"
 
+[[bin]]
+name = "claw-launcher"
+path = "src/bin/claw-launcher.rs"
+
 [dependencies]
 api = { path = "../api" }
 commands = { path = "../commands" }
 compat-harness = { path = "../compat-harness" }
 crossterm = "0.28"
+eframe = "0.31.1"
+image = "0.25"
 pulldown-cmark = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rfd = "0.15"
 rustyline = "15"
 runtime = { path = "../runtime" }
 plugins = { path = "../plugins" }
@@ -23,6 +31,8 @@ serde_json.workspace = true
 syntect = "5"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "time"] }
 tools = { path = "../tools" }
+webbrowser = "1"
+winreg = "0.52"
 
 [lints]
 workspace = true

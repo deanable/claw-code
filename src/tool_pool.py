@@ -29,9 +29,15 @@ def assemble_tool_pool(
     simple_mode: bool = False,
     include_mcp: bool = True,
     permission_context: ToolPermissionContext | None = None,
+    platform_name: str | None = None,
 ) -> ToolPool:
     return ToolPool(
-        tools=get_tools(simple_mode=simple_mode, include_mcp=include_mcp, permission_context=permission_context),
+        tools=get_tools(
+            simple_mode=simple_mode,
+            include_mcp=include_mcp,
+            permission_context=permission_context,
+            platform_name=platform_name,
+        ),
         simple_mode=simple_mode,
         include_mcp=include_mcp,
     )
