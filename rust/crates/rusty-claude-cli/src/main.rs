@@ -3082,8 +3082,10 @@ fn run_repl(
     let resolved_model = resolve_repl_model(model);
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
-    let mut editor =
-        input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
+    let mut editor = input::LineEditor::new(
+        repl_prompt(&std::env::current_dir().unwrap_or_default()),
+        cli.repl_completion_candidates().unwrap_or_default(),
+    );
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
     if let Some(startup_prompt) = launch_prompt_from_env() {
@@ -3092,6 +3094,8 @@ fn run_repl(
     }
 
     loop {
+        // Update the prompt on every turn so branch changes (git checkout) are reflected.
+        editor.set_prompt(repl_prompt(&std::env::current_dir().unwrap_or_default()));
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
         match editor.read_line()? {
             input::ReadOutcome::Submit(input) => {
@@ -3145,6 +3149,42 @@ fn launch_prompt_from_env() -> Option<String> {
     let prompt = std::env::var(LAUNCH_PROMPT_ENV_VAR).ok()?;
     let trimmed = prompt.trim();
     if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn repl_prompt(cwd: &Path) -> String {
+    match read_git_branch(cwd) {
+        Some(branch) => format!("[{branch}] > "),
+        None => "> ".to_string(),
+    }
+}
+
+fn read_git_branch(cwd: &Path) -> Option<String> {
+    // Gate quickly: avoid showing "HEAD" when detached, and avoid git noise when not in a repo.
+    let inside = Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !inside.status.success() {
+        return None;
+    }
+
+    let output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let branch = String::from_utf8(output.stdout).ok()?;
+    let trimmed = branch.trim();
+    if trimmed.is_empty() || trimmed == "HEAD" {
         None
     } else {
         Some(trimmed.to_string())
@@ -7623,7 +7663,11 @@ fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
         "\x1b[1;32m✓\x1b[0m"
     };
     if is_error {
-        let summary = truncate_for_summary(output.trim(), 160);
+        let summary = truncate_output_for_display(
+            output.trim(),
+            TOOL_OUTPUT_DISPLAY_MAX_LINES,
+            TOOL_OUTPUT_DISPLAY_MAX_CHARS,
+        );
         return if summary.is_empty() {
             format!("{icon} \x1b[38;5;245m{name}\x1b[0m")
         } else {
@@ -7646,10 +7690,13 @@ fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
 
 const DISPLAY_TRUNCATION_NOTICE: &str =
     "\x1b[2m… output truncated for display; full result preserved in session.\x1b[0m";
-const READ_DISPLAY_MAX_LINES: usize = 80;
-const READ_DISPLAY_MAX_CHARS: usize = 6_000;
-const TOOL_OUTPUT_DISPLAY_MAX_LINES: usize = 60;
-const TOOL_OUTPUT_DISPLAY_MAX_CHARS: usize = 4_000;
+// The CLI used to truncate tool/read outputs aggressively to keep the terminal tidy.
+// That made it hard to inspect real command output (build logs, curl responses, etc.).
+// Prefer showing the full output and let the terminal scrollback handle it.
+const READ_DISPLAY_MAX_LINES: usize = usize::MAX;
+const READ_DISPLAY_MAX_CHARS: usize = usize::MAX;
+const TOOL_OUTPUT_DISPLAY_MAX_LINES: usize = usize::MAX;
+const TOOL_OUTPUT_DISPLAY_MAX_CHARS: usize = usize::MAX;
 
 fn extract_tool_path(parsed: &serde_json::Value) -> String {
     parsed
@@ -7956,6 +8003,9 @@ fn truncate_output_for_display(content: &str, max_lines: usize, max_chars: usize
     let original = content.trim_end_matches('\n');
     if original.is_empty() {
         return String::new();
+    }
+    if max_lines == usize::MAX && max_chars == usize::MAX {
+        return original.to_string();
     }
 
     let mut preview_lines = Vec::new();

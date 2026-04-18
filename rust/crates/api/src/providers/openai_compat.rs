@@ -41,11 +41,13 @@ pub struct OpenAiCompatConfig {
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
 const DASHSCOPE_ENV_VARS: &[&str] = &["DASHSCOPE_API_KEY"];
+const GROQ_ENV_VARS: &[&str] = &["GROQ_API_KEY"];
 
 // Provider-specific request body size limits in bytes
 const XAI_MAX_REQUEST_BODY_BYTES: usize = 52_428_800; // 50MB
 const OPENAI_MAX_REQUEST_BODY_BYTES: usize = 104_857_600; // 100MB
 const DASHSCOPE_MAX_REQUEST_BODY_BYTES: usize = 6_291_456; // 6MB (observed limit in dogfood)
+const GROQ_MAX_REQUEST_BODY_BYTES: usize = 10_485_760; // 10MB (Groq limit)
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -85,12 +87,26 @@ impl OpenAiCompatConfig {
         }
     }
 
+    /// Groq API endpoint (Llama, Mixtral, etc.).
+    /// Uses the OpenAI-compatible REST shape at /openai/v1.
+    #[must_use]
+    pub const fn groq() -> Self {
+        Self {
+            provider_name: "Groq",
+            api_key_env: "GROQ_API_KEY",
+            base_url_env: "GROQ_BASE_URL",
+            default_base_url: "https://api.groq.com/openai/v1",
+            max_request_body_bytes: GROQ_MAX_REQUEST_BODY_BYTES,
+        }
+    }
+
     #[must_use]
     pub fn credential_env_vars(self) -> &'static [&'static str] {
         match self.provider_name {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
             "DashScope" => DASHSCOPE_ENV_VARS,
+            "Groq" => GROQ_ENV_VARS,
             _ => &[],
         }
     }
@@ -121,6 +137,20 @@ impl OpenAiCompatClient {
         Self {
             http: build_http_client_or_default(),
             api_key: api_key.into(),
+            config,
+            base_url: read_base_url(config),
+            max_retries: DEFAULT_MAX_RETRIES,
+            initial_backoff: DEFAULT_INITIAL_BACKOFF,
+            max_backoff: DEFAULT_MAX_BACKOFF,
+        }
+    }
+
+    /// Create a client without API key (for local providers like Ollama)
+    #[must_use]
+    pub fn new_without_key(config: OpenAiCompatConfig) -> Self {
+        Self {
+            http: build_http_client_or_default(),
+            api_key: String::new(),
             config,
             base_url: read_base_url(config),
             max_retries: DEFAULT_MAX_RETRIES,

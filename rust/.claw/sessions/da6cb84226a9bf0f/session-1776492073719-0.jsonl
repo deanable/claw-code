@@ -1,0 +1,2 @@
+{"created_at_ms":1776492073718,"model":"openai/gpt-4.1-mini","session_id":"session-1776492073719-0","type":"session_meta","updated_at_ms":1776492073718,"version":1,"workspace_root":"C:\\Users\\Dean\\source\\repos\\claw-code\\rust"}
+{"message":{"blocks":[{"text":"/exit","type":"text"}],"role":"user"},"type":"message"}

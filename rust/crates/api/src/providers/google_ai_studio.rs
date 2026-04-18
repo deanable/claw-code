@@ -670,6 +670,7 @@ fn parse_google_error(status: reqwest::StatusCode, body: &str) -> ApiError {
         request_id: None,
         body: body.to_string(),
         retryable,
+        suggested_action: None,
     }
 }
 

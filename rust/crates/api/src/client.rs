@@ -15,6 +15,23 @@ pub enum ProviderClient {
     OpenAi(OpenAiCompatClient),
 }
 
+fn is_likely_local_openai_endpoint(base_url: &str) -> bool {
+    let lower = base_url.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    if lower.contains("ollama")
+        || lower.contains("localhost")
+        || lower.contains("127.0.0.1")
+        || lower.contains("[::1]")
+        || lower.contains("host.docker.internal")
+    {
+        return true;
+    }
+    // Ollama defaults to port 11434; allow custom hostnames/IPs on that port.
+    lower.contains(":11434")
+}
+
 impl ProviderClient {
     pub fn from_model(model: &str) -> Result<Self, ApiError> {
         Self::from_model_with_anthropic_auth(model, None)
@@ -37,16 +54,66 @@ impl ProviderClient {
                 OpenAiCompatConfig::xai(),
             )?)),
             ProviderKind::OpenAi => {
-                // DashScope models (qwen-*) also return ProviderKind::OpenAi because they
-                // speak the OpenAI wire format, but they need the DashScope config which
-                // reads DASHSCOPE_API_KEY and points at dashscope.aliyuncs.com.
-                let config = match providers::metadata_for_model(&resolved_model) {
-                    Some(meta) if meta.auth_env == "DASHSCOPE_API_KEY" => {
+                // DashScope models (qwen-*) and Groq models return ProviderKind::OpenAi 
+                // because they speak the OpenAI wire format, but they need different configs
+                // which read different API keys and point at different endpoints.
+                // For local providers like Ollama, we skip API key requirement.
+                
+                // Check for Groq first (GROQ_API_KEY or GROQ_BASE_URL set)
+                let groq_key = std::env::var("GROQ_API_KEY").ok();
+                let groq_base = std::env::var("GROQ_BASE_URL").ok();
+                let has_groq = groq_key.is_some() || groq_base.is_some();
+                
+                // Check for local providers
+                let openai_base = std::env::var("OPENAI_BASE_URL").unwrap_or_default();
+                let is_local = is_likely_local_openai_endpoint(&openai_base);
+
+                // If the user explicitly points OPENAI_BASE_URL at a local endpoint (Ollama/LM Studio/etc),
+                // always treat this as a local OpenAI-compatible backend regardless of model prefix.
+                // This prevents qwen/* or kimi-* model strings from incorrectly routing to DashScope and
+                // demanding DASHSCOPE_API_KEY when the intent is clearly "use my local server".
+                if is_local {
+                    return Ok(Self::OpenAi(OpenAiCompatClient::new_without_key(
+                        OpenAiCompatConfig::openai(),
+                    )));
+                }
+
+                let groq_is_local = groq_base
+                    .as_ref()
+                    .is_some_and(|b| is_likely_local_openai_endpoint(b));
+                
+                let config = if has_groq {
+                    // Check if model is explicitly Groq-prefixed
+                    let meta = providers::metadata_for_model(&resolved_model);
+                    if meta.as_ref().map(|m| m.auth_env == "GROQ_API_KEY").unwrap_or(false) {
+                        OpenAiCompatConfig::groq()
+                    } else if meta.as_ref().map(|m| m.auth_env == "DASHSCOPE_API_KEY").unwrap_or(false) {
                         OpenAiCompatConfig::dashscope()
+                    } else if !groq_base.as_ref().map(|b| b.contains("api.groq.com")).unwrap_or(false) {
+                        // GROQ_BASE_URL is set but not the default - likely a local Groq
+                        OpenAiCompatConfig::groq()
+                    } else if groq_key.is_some() {
+                        // GROQ_API_KEY is set - use Groq config
+                        OpenAiCompatConfig::groq()
+                    } else {
+                        OpenAiCompatConfig::openai()
                     }
-                    _ => OpenAiCompatConfig::openai(),
+                } else {
+                    // No Groq - use model metadata or default OpenAI
+                    match providers::metadata_for_model(&resolved_model) {
+                        Some(meta) if meta.auth_env == "DASHSCOPE_API_KEY" => {
+                            OpenAiCompatConfig::dashscope()
+                        }
+                        _ => OpenAiCompatConfig::openai(),
+                    }
                 };
-                Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
+                
+                if is_local || groq_is_local {
+                    // Local provider doesn't need API key
+                    Ok(Self::OpenAi(OpenAiCompatClient::new_without_key(config)))
+                } else {
+                    Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
+                }
             }
         }
     }
@@ -253,6 +320,58 @@ mod tests {
                 );
             }
             other => panic!("Expected ProviderClient::OpenAi for qwen-plus, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ollama_port_on_non_loopback_host_skips_dashscope_credentials() {
+        // Regression: local Ollama reachable via LAN host/IP (still port 11434)
+        // should not require DASHSCOPE_API_KEY even for qwen-* model names.
+        let _lock = env_lock();
+        let _openai_base = EnvVarGuard::set("OPENAI_BASE_URL", Some("http://192.168.1.20:11434/v1"));
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+        let _groq = EnvVarGuard::set("GROQ_API_KEY", None);
+        let _groq_base = EnvVarGuard::set("GROQ_BASE_URL", None);
+
+        let client = ProviderClient::from_model("qwen-plus");
+
+        assert!(
+            client.is_ok(),
+            "local Ollama endpoint should not require DashScope credentials, got: {:?}",
+            client.err()
+        );
+        match client.unwrap() {
+            ProviderClient::OpenAi(openai_client) => {
+                assert!(
+                    openai_client.base_url().contains("192.168.1.20:11434"),
+                    "client should target the configured local Ollama endpoint, got: {}",
+                    openai_client.base_url()
+                );
+            }
+            other => panic!("Expected ProviderClient::OpenAi for local Ollama qwen model, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_openai_base_url_overrides_qwen_dashscope_routing() {
+        // Regression: when OPENAI_BASE_URL points to a local OpenAI-compatible server,
+        // qwen/* and qwen-* model strings must not force DashScope auth/base URL.
+        let _lock = env_lock();
+        let _openai_base = EnvVarGuard::set("OPENAI_BASE_URL", Some("http://localhost:11434/v1"));
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+
+        let client = ProviderClient::from_model("qwen-plus").expect("client should build");
+        match client {
+            ProviderClient::OpenAi(openai_client) => {
+                assert!(
+                    openai_client.base_url().contains("localhost:11434"),
+                    "client should use OPENAI_BASE_URL for local routing, got: {}",
+                    openai_client.base_url()
+                );
+            }
+            other => panic!("Expected ProviderClient::OpenAi, got: {other:?}"),
         }
     }
 }

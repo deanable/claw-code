@@ -27,6 +27,11 @@ const LEGACY_DEFAULT_MODEL: &str = "llama-3.3-70b-versatile";
 const NEW_PROVIDER_KEY: &str = "__new_provider__";
 const LAUNCH_PROFILE_FILE_NAME: &str = ".claw-launch.json";
 const LAUNCHER_LOG_FILE_NAME: &str = "claw-launcher.log";
+const SANDBOX_SETTINGS_LOCAL_FILE_NAME: &str = "settings.local.json";
+
+fn default_sandbox_enabled() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,15 +39,17 @@ enum ProviderKind {
     Groq,
     OpenRouter,
     GoogleAiStudio,
+    Ollama,
     Custom,
 }
 
 impl ProviderKind {
-    fn all() -> [Self; 4] {
+    fn all() -> [Self; 5] {
         [
             Self::Groq,
             Self::OpenRouter,
             Self::GoogleAiStudio,
+            Self::Ollama,
             Self::Custom,
         ]
     }
@@ -52,23 +59,25 @@ impl ProviderKind {
             Self::Groq => "Groq",
             Self::OpenRouter => "OpenRouter",
             Self::GoogleAiStudio => "Google AI Studio",
+            Self::Ollama => "Ollama (Local)",
             Self::Custom => "Custom",
         }
     }
 
     fn supports_remote_models(self) -> bool {
-        !matches!(self, Self::GoogleAiStudio)
-    }
-
-    fn requires_api_key(self) -> bool {
         true
     }
 
-    fn api_key_url(self) -> &'static str {
+    fn requires_api_key(self) -> bool {
+        !matches!(self, Self::Ollama)
+    }
+
+fn api_key_url(self) -> &'static str {
         match self {
             Self::Groq => "https://console.groq.com/keys",
             Self::OpenRouter => "https://openrouter.ai/keys",
             Self::GoogleAiStudio => "https://aistudio.google.com/app/apikey",
+            Self::Ollama => "https://ollama.com/download",
             Self::Custom => "https://platform.openai.com/api-keys",
         }
     }
@@ -89,6 +98,12 @@ struct ProviderProfile {
     prompt: String,
     args: Vec<String>,
     respect_rate_limits: bool,
+    #[serde(default = "default_sandbox_enabled")]
+    sandbox_enabled: bool,
+    #[serde(default)]
+    compact_output: bool,
+    #[serde(default)]
+    dangerously_skip_permissions: bool,
 }
 
 impl ProviderProfile {
@@ -106,6 +121,9 @@ impl ProviderProfile {
             prompt: String::new(),
             args: Vec::new(),
             respect_rate_limits: true,
+            sandbox_enabled: default_sandbox_enabled(),
+            compact_output: false,
+            dangerously_skip_permissions: false,
         }
     }
 }
@@ -121,6 +139,12 @@ impl Default for ProviderProfile {
 struct LauncherState {
     profiles: Vec<ProviderProfile>,
     last_selected: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ui_selected_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ui_draft: Option<ProviderProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ui_model_search_filter: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +206,16 @@ struct OpenAiCompatModel {
     id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct OllamaTagsList {
+    models: Vec<OllamaTagModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaTagModel {
+    name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LaunchProfileFile {
@@ -214,6 +248,12 @@ struct LaunchProfileFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     respect_rate_limits: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    sandbox_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compact_output: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dangerously_skip_permissions: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     profiles: Option<Vec<ProviderProfile>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_selected: Option<String>,
@@ -236,7 +276,9 @@ struct LauncherApp {
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 780.0])
+            // Make the default window a bit taller so bottom controls aren't truncated
+            // on common Windows DPI/scaling settings.
+            .with_inner_size([900.0, 860.0])
             .with_icon(load_launcher_window_icon()),
         ..Default::default()
     };
@@ -402,47 +444,93 @@ impl LauncherApp {
     }
 
     fn refresh_models_with_status(&mut self, set_status: bool) {
-        self.models = initial_models(
+        let refreshed = refresh_models_from_endpoint(
             self.draft.provider_kind,
             &self.draft.base_url,
             &self.draft.api_key,
         );
+        match refreshed {
+            Ok(models) => {
+                self.models = models;
+                if set_status {
+                    self.status = format!(
+                        "Fetched {} model{} from {}.",
+                        self.models.len(),
+                        if self.models.len() == 1 { "" } else { "s" },
+                        self.draft.provider_kind.label()
+                    );
+                }
+            }
+            Err(error) => {
+                // For local providers, don't keep a stale bundled list (it looks like
+                // the refresh worked when it didn't).
+                if matches!(self.draft.provider_kind, ProviderKind::Ollama) {
+                    self.models.clear();
+                }
+                if set_status {
+                    self.status = format!("Failed to fetch models: {error}");
+                }
+            }
+        }
+        if self.models.is_empty()
+            && matches!(self.draft.provider_kind, ProviderKind::Ollama)
+            && !self.draft.model.trim().is_empty()
+        {
+            // If the local endpoint can't be queried, keep the UI usable by
+            // showing the typed model id as the only option.
+            self.models = vec![ModelView {
+                id: self.draft.model.trim().to_string(),
+                label: "Typed model".to_string(),
+                context_window: provider_default_token_limit(self.draft.provider_kind).0,
+                max_output_tokens: provider_default_token_limit(self.draft.provider_kind).1,
+                tool_use_supported: true,
+                from_api: false,
+            }];
+        }
         if self.models.iter().all(|model| model.id != self.draft.model) {
             if let Some(first) = self.models.first() {
                 self.draft.model = first.id.clone();
             }
         }
         self.sanitize_selected_tools();
-        if set_status {
-            self.status = if self.draft.api_key.trim().is_empty()
-                && self.draft.provider_kind.requires_api_key()
-            {
-                format!(
-                    "Add an API key for {} to load live models.",
-                    self.draft.provider_kind.label()
-                )
-            } else {
-                format!("Loaded models for {}.", self.draft.provider_kind.label())
-            };
-        }
     }
 
     fn apply_model_search(&mut self) {
         let matches = self.filtered_models().len();
         self.status = if self.model_search_filter.is_empty() {
-            "Showing all known models for this provider.".to_string()
+            if matches!(self.draft.provider_kind, ProviderKind::Ollama) {
+                "Showing all fetched models for this provider.".to_string()
+            } else {
+                "Showing all known models for this provider.".to_string()
+            }
         } else if matches == 0 {
-            format!(
-                "No known models matched '{}'. You can still launch with the typed model id.",
-                self.model_search_filter
-            )
+            if matches!(self.draft.provider_kind, ProviderKind::Ollama) {
+                format!(
+                    "No fetched models matched '{}'. You can still launch with the typed model id.",
+                    self.model_search_filter
+                )
+            } else {
+                format!(
+                    "No known models matched '{}'. You can still launch with the typed model id.",
+                    self.model_search_filter
+                )
+            }
         } else {
-            format!(
-                "Filtered known models with '{}'. {} match{}.",
-                self.model_search_filter,
-                matches,
-                if matches == 1 { "" } else { "es" }
-            )
+            if matches!(self.draft.provider_kind, ProviderKind::Ollama) {
+                format!(
+                    "Filtered fetched models with '{}'. {} match{}.",
+                    self.model_search_filter,
+                    matches,
+                    if matches == 1 { "" } else { "es" }
+                )
+            } else {
+                format!(
+                    "Filtered known models with '{}'. {} match{}.",
+                    self.model_search_filter,
+                    matches,
+                    if matches == 1 { "" } else { "es" }
+                )
+            }
         };
     }
 
@@ -561,12 +649,25 @@ impl LauncherApp {
         let user_profile = std::env::var("USERPROFILE")
             .map_err(|_| "USERPROFILE is not set on this machine.".to_string())?;
 
+        write_sandbox_settings_local(&launch_profile.workspace, launch_profile.sandbox_enabled)?;
+
+        let effective_permission_mode = if launch_profile.dangerously_skip_permissions {
+            "danger-full-access"
+        } else {
+            launch_profile.permission_mode.as_str()
+        };
         let mut claw_command = format!(
             "& '{}' --model '{}' --permission-mode '{}'",
             powershell_escape(&self.claw_path.display().to_string()),
             powershell_escape(&launch_profile.model),
-            powershell_escape(&launch_profile.permission_mode)
+            powershell_escape(effective_permission_mode)
         );
+        if launch_profile.compact_output {
+            claw_command.push_str(" --compact");
+        }
+        if launch_profile.dangerously_skip_permissions {
+            claw_command.push_str(" --dangerously-skip-permissions");
+        }
         if !launch_profile.allowed_tools.is_empty() {
             claw_command.push_str(&format!(
                 " --allowedTools '{}'",
@@ -843,39 +944,65 @@ impl eframe::App for LauncherApp {
             });
 
             ui.add_space(8.0);
-            ui.group(|ui| {
-                ui.heading("Workspace And Launch");
-                ui.horizontal(|ui| {
-                    ui.label("Workspace");
-                    let mut workspace_display = self.draft.workspace.display().to_string();
-                    ui.add_enabled(
-                        false,
-                        TextEdit::singleline(&mut workspace_display).desired_width(420.0),
-                    );
-                    if ui.button("Select Folder").clicked() {
-                        if let Some(folder) = rfd::FileDialog::new()
-                            .set_directory(&self.draft.workspace)
-                            .pick_folder()
-                        {
-                            self.draft.workspace = folder;
-                        }
-                    }
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Permission");
-                    egui::ComboBox::from_id_salt("permission-mode")
-                        .selected_text(self.draft.permission_mode.clone())
-                        .show_ui(ui, |ui| {
-                            for mode in ["danger-full-access", "workspace-write", "read-only"] {
-                                ui.selectable_value(
-                                    &mut self.draft.permission_mode,
-                                    mode.to_string(),
-                                    mode,
-                                );
+                ui.group(|ui| {
+                    ui.heading("Workspace And Launch");
+                    ui.horizontal(|ui| {
+                        ui.label("Project folder");
+                        let mut workspace_display = self.draft.workspace.display().to_string();
+                        ui.add_enabled(
+                            false,
+                            TextEdit::singleline(&mut workspace_display).desired_width(420.0),
+                        );
+                        if ui.button("Select Folder").clicked() {
+                            if let Some(folder) = rfd::FileDialog::new()
+                                .set_directory(&self.draft.workspace)
+                                .pick_folder()
+                            {
+                                if let Some(root) = resolve_git_root(&folder) {
+                                    self.draft.workspace = root.clone();
+                                    let branch = read_git_branch(&root).unwrap_or_else(|| "unknown".to_string());
+                                    self.status = format!(
+                                        "Selected git project: {} (branch {}).",
+                                        root.display(),
+                                        branch
+                                    );
+                                } else {
+                                    self.draft.workspace = folder.clone();
+                                    self.status = format!(
+                                        "Selected folder (not a git repo): {}.",
+                                        folder.display()
+                                    );
+                                }
                             }
-                        });
+                        }
+                    });
+
+                    if let Some(branch) = read_git_branch(&self.draft.workspace) {
+                        ui.small(format!("Git branch: {branch}"));
+                    } else {
+                        ui.small("Git branch: (not a git repo)");
+                    }
+
+                    ui.horizontal(|ui| {
+                        ui.label("Permission");
+                        ui.add_enabled_ui(!self.draft.dangerously_skip_permissions, |ui| {
+                            egui::ComboBox::from_id_salt("permission-mode")
+                            .selected_text(self.draft.permission_mode.clone())
+                            .show_ui(ui, |ui| {
+                                for mode in ["danger-full-access", "workspace-write", "read-only"] {
+                                    ui.selectable_value(
+                                        &mut self.draft.permission_mode,
+                                        mode.to_string(),
+                                        mode,
+                                    );
+                                }
+                            });
+                    });
+                    if self.draft.dangerously_skip_permissions {
+                        ui.small("Forced: danger-full-access");
+                    }
                     ui.checkbox(&mut self.draft.keep_open, "Keep terminal open");
+                    ui.checkbox(&mut self.draft.sandbox_enabled, "Sandbox mode");
                 });
 
                 ui.label("Prompt");
@@ -885,12 +1012,34 @@ impl eframe::App for LauncherApp {
                         .desired_rows(3),
                 );
 
-                ui.label("Extra args (one per line)");
-                ui.add(
-                    TextEdit::multiline(&mut self.args_text)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(2),
-                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Options");
+                    if ui
+                        .checkbox(&mut self.draft.compact_output, "Compact output")
+                        .clicked()
+                    {
+                        // no-op; state stored in profile
+                    }
+                    if ui
+                        .checkbox(
+                            &mut self.draft.dangerously_skip_permissions,
+                            "Skip permission checks",
+                        )
+                        .clicked()
+                        && self.draft.dangerously_skip_permissions
+                    {
+                        self.draft.permission_mode = "danger-full-access".to_string();
+                    }
+                });
+
+                ui.collapsing("Advanced", |ui| {
+                    ui.label("Extra args (one per line)");
+                    ui.add(
+                        TextEdit::multiline(&mut self.args_text)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(2),
+                    );
+                });
             });
 
             ui.add_space(8.0);
@@ -899,10 +1048,14 @@ impl eframe::App for LauncherApp {
                 ui.horizontal(|ui| {
                     ui.label("Search");
                     let search_response = ui.add(
-                        TextEdit::singleline(&mut self.model_search_filter).desired_width(280.0),
+                        TextEdit::singleline(&mut self.model_search_filter)
+                            .hint_text("Filter models (Enter refreshes)")
+                            .desired_width(280.0),
                     );
-                    if ui.button("Search").clicked() {
-                        self.apply_model_search();
+                    let enter_pressed = search_response.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.button("Search/Refresh").clicked() || enter_pressed {
+                        self.refresh_models_with_status(true);
                     }
                     if search_response.changed() {
                         self.apply_model_search();
@@ -911,9 +1064,9 @@ impl eframe::App for LauncherApp {
                     let mut newly_selected_model = None;
                     egui::ComboBox::from_id_salt("model-select")
                         .selected_text(if self.model_search_filter.trim().is_empty() {
-                            "Choose known model".to_string()
+                            format!("Choose model ({})", filtered_models.len())
                         } else {
-                            format!("Choose known model ({})", filtered_models.len())
+                            format!("Choose model ({})", filtered_models.len())
                         })
                         .width(260.0)
                         .show_ui(ui, |ui| {
@@ -934,6 +1087,9 @@ impl eframe::App for LauncherApp {
                                 }
                             }
                         });
+                    if ui.button("Refresh models").clicked() {
+                        self.refresh_models_with_status(true);
+                    }
                     if let Some(model_id) = newly_selected_model {
                         self.draft.model = model_id;
                         self.sanitize_selected_tools();
@@ -1067,7 +1223,43 @@ fn default_workspace() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn provider_presets() -> [ProviderPreset; 4] {
+fn resolve_git_root(path: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8(output.stdout).ok()?;
+    let trimmed = root.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
+    }
+}
+
+fn read_git_branch(path: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8(output.stdout).ok()?;
+    let trimmed = branch.trim();
+    if trimmed.is_empty() || trimmed == "HEAD" {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn provider_presets() -> [ProviderPreset; 5] {
     [
         ProviderPreset {
             kind: ProviderKind::Groq,
@@ -1086,6 +1278,12 @@ fn provider_presets() -> [ProviderPreset; 4] {
             name: "Google AI Studio",
             base_url: "https://generativelanguage.googleapis.com/v1beta",
             model: "gemini-2.0-flash",
+        },
+        ProviderPreset {
+            kind: ProviderKind::Ollama,
+            name: "Ollama (Local)",
+            base_url: "http://localhost:11434/v1",
+            model: "llama3",
         },
         ProviderPreset {
             kind: ProviderKind::Custom,
@@ -1147,11 +1345,17 @@ fn load_launcher_state(legacy_config_path: &Path) -> (LauncherState, String) {
             prompt: legacy.prompt.unwrap_or_default(),
             args: legacy.args,
             respect_rate_limits: true,
+            sandbox_enabled: default_sandbox_enabled(),
+            compact_output: false,
+            dangerously_skip_permissions: false,
         };
         return (
             LauncherState {
                 profiles: vec![profile],
                 last_selected: Some("Imported provider".to_string()),
+                ui_selected_provider: None,
+                ui_draft: None,
+                ui_model_search_filter: None,
             },
             "Imported the legacy launcher config. Save once to migrate it into the registry."
                 .to_string(),
@@ -1161,6 +1365,9 @@ fn load_launcher_state(legacy_config_path: &Path) -> (LauncherState, String) {
         LauncherState {
             profiles: starter_profiles(),
             last_selected: Some("Groq".to_string()),
+            ui_selected_provider: None,
+            ui_draft: None,
+            ui_model_search_filter: None,
         },
         "Created starter provider profiles. Add your API key and workspace, then save.".to_string(),
     )
@@ -1208,6 +1415,10 @@ fn load_state_from_sidecar(
     Some(LauncherState {
         profiles: merge_profiles_with_registry(merged_profiles, registry_state),
         last_selected,
+        ui_selected_provider: registry_state.and_then(|state| state.ui_selected_provider.clone()),
+        ui_draft: registry_state.and_then(|state| state.ui_draft.clone()),
+        ui_model_search_filter: registry_state
+            .and_then(|state| state.ui_model_search_filter.clone()),
     })
 }
 
@@ -1328,6 +1539,18 @@ fn profile_from_sidecar(
             .respect_rate_limits
             .or_else(|| fallback.as_ref().map(|profile| profile.respect_rate_limits))
             .unwrap_or(true),
+        sandbox_enabled: sidecar
+            .sandbox_enabled
+            .or_else(|| fallback.as_ref().map(|profile| profile.sandbox_enabled))
+            .unwrap_or_else(default_sandbox_enabled),
+        compact_output: sidecar
+            .compact_output
+            .or_else(|| fallback.as_ref().map(|profile| profile.compact_output))
+            .unwrap_or(false),
+        dangerously_skip_permissions: sidecar
+            .dangerously_skip_permissions
+            .or_else(|| fallback.as_ref().map(|profile| profile.dangerously_skip_permissions))
+            .unwrap_or(false),
     })
 }
 
@@ -1402,6 +1625,9 @@ fn merge_profile_with_registry_fallback(
             profile.args
         },
         respect_rate_limits: profile.respect_rate_limits,
+        sandbox_enabled: profile.sandbox_enabled,
+        compact_output: profile.compact_output,
+        dangerously_skip_permissions: profile.dangerously_skip_permissions,
     }
 }
 
@@ -1447,12 +1673,50 @@ fn write_launch_profile(
         context_window_tokens: Some(token_limit.0),
         max_output_tokens: Some(token_limit.1),
         respect_rate_limits: Some(profile.respect_rate_limits),
+        sandbox_enabled: Some(profile.sandbox_enabled),
+        compact_output: Some(profile.compact_output),
+        dangerously_skip_permissions: Some(profile.dangerously_skip_permissions),
         profiles: state.map(|state| state.profiles.clone()),
         last_selected: Some(profile.friendly_name.clone()),
     };
     let body = serde_json::to_string_pretty(&launch_profile)
         .map_err(|error| format!("failed to serialize launch profile: {error}"))?;
     let path = profile.workspace.join(LAUNCH_PROFILE_FILE_NAME);
+    fs::write(&path, body).map_err(|error| format!("failed to write {}: {error}", path.display()))
+}
+
+fn write_sandbox_settings_local(workspace: &Path, enabled: bool) -> Result<(), String> {
+    let config_dir = workspace.join(".claw");
+    fs::create_dir_all(&config_dir)
+        .map_err(|error| format!("failed to create {}: {error}", config_dir.display()))?;
+    let path = config_dir.join(SANDBOX_SETTINGS_LOCAL_FILE_NAME);
+
+    let mut root = if path.is_file() {
+        let body = fs::read_to_string(&path)
+            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        if body.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str::<serde_json::Value>(&body)
+                .map_err(|error| format!("failed to parse {}: {error}", path.display()))?
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    let object = root
+        .as_object_mut()
+        .ok_or_else(|| format!("{} must be a JSON object", path.display()))?;
+    let sandbox = object
+        .entry("sandbox")
+        .or_insert_with(|| serde_json::json!({}));
+    let sandbox_object = sandbox
+        .as_object_mut()
+        .ok_or_else(|| format!("{}.sandbox must be a JSON object", path.display()))?;
+    sandbox_object.insert("enabled".to_string(), serde_json::Value::Bool(enabled));
+
+    let body = serde_json::to_string_pretty(&root)
+        .map_err(|error| format!("failed to serialize {}: {error}", path.display()))?;
     fs::write(&path, body).map_err(|error| format!("failed to write {}: {error}", path.display()))
 }
 
@@ -1541,6 +1805,13 @@ fn launch_env_vars(profile: &ProviderProfile) -> Vec<(&'static str, String)> {
             vars.push(("GOOGLE_API_KEY", profile.api_key.clone()));
             vars.push(("GOOGLE_BASE_URL", profile.base_url.clone()));
         }
+        ProviderKind::Groq => {
+            vars.push(("GROQ_API_KEY", profile.api_key.clone()));
+            vars.push(("GROQ_BASE_URL", profile.base_url.clone()));
+        }
+        ProviderKind::Ollama => {
+            vars.push(("OPENAI_BASE_URL", profile.base_url.clone()));
+        }
         _ => {
             vars.push(("OPENAI_API_KEY", profile.api_key.clone()));
             vars.push(("OPENAI_BASE_URL", profile.base_url.clone()));
@@ -1554,6 +1825,7 @@ fn provider_default_token_limit(provider_kind: ProviderKind) -> (u32, u32) {
         ProviderKind::Groq => (131_072, 8_192),
         ProviderKind::OpenRouter => (131_072, 16_384),
         ProviderKind::GoogleAiStudio => (131_072, 16_384),
+        ProviderKind::Ollama => (32_768, 4_096),
         ProviderKind::Custom => (131_072, 16_384),
     }
 }
@@ -1695,55 +1967,57 @@ fn known_models() -> Vec<KnownModel> {
     ]
 }
 
-fn initial_models(provider_kind: ProviderKind, base_url: &str, api_key: &str) -> Vec<ModelView> {
-    let mut by_id = known_models()
-        .into_iter()
-        .filter(model_is_applicable)
-        .filter(|model| model_matches_provider(model.id, provider_kind))
-        .map(|model| {
-            (
-                model.id.to_string(),
-                ModelView {
-                    id: model.id.to_string(),
-                    label: model.label.to_string(),
-                    context_window: model.context_window,
-                    max_output_tokens: model.max_output_tokens,
-                    tool_use_supported: model.tool_use_supported,
-                    from_api: false,
-                },
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
+fn refresh_models_from_endpoint(
+    provider_kind: ProviderKind,
+    base_url: &str,
+    api_key: &str,
+) -> Result<Vec<ModelView>, String> {
+    let mut by_id = if matches!(provider_kind, ProviderKind::Ollama) {
+        BTreeMap::new()
+    } else {
+        known_models()
+            .into_iter()
+            .filter(model_is_applicable)
+            .filter(|model| model_matches_provider(model.id, provider_kind))
+            .map(|model| {
+                (
+                    model.id.to_string(),
+                    ModelView {
+                        id: model.id.to_string(),
+                        label: model.label.to_string(),
+                        context_window: model.context_window,
+                        max_output_tokens: model.max_output_tokens,
+                        tool_use_supported: model.tool_use_supported,
+                        from_api: false,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
 
-    if provider_kind.supports_remote_models() {
-        if let Ok(remote_models) = fetch_models(provider_kind, base_url, api_key) {
-            for remote_model in remote_models {
-                if !model_matches_provider(&remote_model.id, provider_kind)
-                    || !remote_model_is_applicable(&remote_model.id)
-                {
-                    continue;
-                }
-                let entry = by_id
-                    .entry(remote_model.id.clone())
-                    .or_insert_with(|| ModelView {
-                        id: remote_model.id.clone(),
-                        label: known_model_label(&remote_model.id)
-                            .unwrap_or_else(|| remote_model.id.clone()),
-                        context_window: known_model_context_window(&remote_model.id)
-                            .unwrap_or(131_072),
-                        max_output_tokens: known_model_max_output_tokens(&remote_model.id)
-                            .unwrap_or(8_192),
-                        tool_use_supported: true,
-                        from_api: true,
-                    });
-                entry.from_api = true;
-            }
+    let remote_models = fetch_models(provider_kind, base_url, api_key)?;
+    for remote_model in remote_models {
+        if !model_matches_provider(&remote_model.id, provider_kind)
+            || !remote_model_is_applicable(&remote_model.id)
+        {
+            continue;
         }
+        let entry = by_id
+            .entry(remote_model.id.clone())
+            .or_insert_with(|| ModelView {
+                id: remote_model.id.clone(),
+                label: known_model_label(&remote_model.id).unwrap_or_else(|| remote_model.id.clone()),
+                context_window: known_model_context_window(&remote_model.id).unwrap_or(131_072),
+                max_output_tokens: known_model_max_output_tokens(&remote_model.id).unwrap_or(8_192),
+                tool_use_supported: true,
+                from_api: true,
+            });
+        entry.from_api = true;
     }
 
     let mut models = by_id.into_values().collect::<Vec<_>>();
     models.sort_by(|left, right| left.id.cmp(&right.id));
-    models
+    Ok(models)
 }
 
 fn fetch_models(
@@ -1765,6 +2039,46 @@ fn fetch_models(
     let client = Client::builder()
         .build()
         .map_err(|error| format!("http client build failed: {error}"))?;
+
+    // Ollama can expose models via OpenAI-compat `/v1/models` *or* the native
+    // `/api/tags`. Try both to keep the launcher flexible.
+    if matches!(provider_kind, ProviderKind::Ollama) {
+        let url = format!("{}/models", trimmed_url.trim_end_matches('/'));
+        let response = client
+            .get(&url)
+            .send()
+            .map_err(|error| format!("failed to fetch models: {error}"))?;
+        let models_status = response.status();
+        if models_status.is_success() {
+            if let Ok(payload) = response.json::<OpenAiCompatModelList>() {
+                return Ok(payload.data);
+            }
+            // Fall through to /api/tags if the response shape isn't compatible.
+        }
+
+        let base = trimmed_url.trim_end_matches('/');
+        let base = base.strip_suffix("/v1").unwrap_or(base);
+        let tags_url = format!("{}/api/tags", base);
+        let response = client
+            .get(&tags_url)
+            .send()
+            .map_err(|error| format!("failed to fetch Ollama tags: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "GET {url} -> {models_status}; GET {tags_url} -> {}",
+                response.status()
+            ));
+        }
+        let payload = response
+            .json::<OllamaTagsList>()
+            .map_err(|error| format!("failed to parse Ollama tags response: {error}"))?;
+        return Ok(payload
+            .models
+            .into_iter()
+            .map(|model| OpenAiCompatModel { id: model.name })
+            .collect());
+    }
+
     let mut request = client.get(format!("{}/models", trimmed_url.trim_end_matches('/')));
     if provider_kind.requires_api_key() {
         request = request.bearer_auth(api_key.trim());
@@ -1800,6 +2114,7 @@ fn model_matches_provider(model_id: &str, provider_kind: ProviderKind) -> bool {
         }
         ProviderKind::OpenRouter => lowered.contains('/'),
         ProviderKind::GoogleAiStudio => lowered.starts_with("gemini-"),
+        ProviderKind::Ollama => true,
         ProviderKind::Custom => true,
     }
 }

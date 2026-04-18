@@ -14,6 +14,20 @@
       "installed_at_unix_ms": 1775597184344,
       "updated_at_unix_ms": 1775597184344
     },
+    "google-workspace-manager@bundled": {
+      "kind": "bundled",
+      "id": "google-workspace-manager@bundled",
+      "name": "google-workspace-manager",
+      "version": "0.1.0",
+      "description": "Manage Google Workspace accounts, Apps Script projects, deployments, and admin actions from Claw.",
+      "install_path": ".claw\\plugins\\installed\\google-workspace-manager-bundled",
+      "source": {
+        "type": "local_path",
+        "path": "C:\\Users\\Dean\\source\\repos\\claw-code\\rust\\crates\\plugins\\bundled\\google-workspace-manager"
+      },
+      "installed_at_unix_ms": 1776492063614,
+      "updated_at_unix_ms": 1776492063614
+    },
     "sample-hooks@bundled": {
       "kind": "bundled",
       "id": "sample-hooks@bundled",

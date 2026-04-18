@@ -8,6 +8,7 @@ use crate::error::ApiError;
 use crate::types::{MessageRequest, MessageResponse};
 
 pub mod anthropic;
+pub mod google_ai_studio;
 pub mod openai_compat;
 
 #[allow(dead_code)]
@@ -33,6 +34,7 @@ pub enum ProviderKind {
     Anthropic,
     Xai,
     OpenAi,
+    GoogleAiStudio,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +159,7 @@ pub fn resolve_model_alias(model: &str) -> String {
                     "kimi" => "kimi-k2.5",
                     _ => trimmed,
                 },
+                ProviderKind::GoogleAiStudio => trimmed,
             })
         })
         .map_or_else(|| trimmed.to_string(), ToOwned::to_owned)
@@ -206,6 +209,16 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
         });
     }
+    // Groq models (llama-3.3-70b-versatile, mixtral-8x7b-32768, etc.)
+    // Routes to the OpenAI-compatible client with Groq's API key.
+    if canonical.starts_with("groq/") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "GROQ_API_KEY",
+            base_url_env: "GROQ_BASE_URL",
+            default_base_url: "https://api.groq.com/openai/v1",
+        });
+    }
     // Kimi models (kimi-k2.5, kimi-k1.5, etc.) via DashScope compatible-mode.
     // Routes kimi/* and kimi-* model names to DashScope endpoint.
     if canonical.starts_with("kimi/") || canonical.starts_with("kimi-") {
@@ -224,6 +237,26 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     if let Some(metadata) = metadata_for_model(model) {
         return metadata.provider;
     }
+    // Check for local Ollama or other local providers before checking remote providers
+    if let Some(base_url) = std::env::var_os("OPENAI_BASE_URL") {
+        let base_url_str = base_url.to_string_lossy().to_lowercase();
+        if base_url_str.contains("localhost:11434") 
+            || base_url_str.contains("ollama")
+            || base_url_str.contains("127.0.0.1:11434") 
+        {
+            return ProviderKind::OpenAi;
+        }
+    }
+    // Check for Groq specifically before generic OpenAI checks
+    if let Some(base_url) = std::env::var_os("GROQ_BASE_URL") {
+        let base_url_str = base_url.to_string_lossy().to_lowercase();
+        if base_url_str.contains("groq") {
+            return ProviderKind::OpenAi;
+        }
+    }
+    if openai_compat::has_api_key("GROQ_API_KEY") {
+        return ProviderKind::OpenAi;
+    }
     // When OPENAI_BASE_URL is set, the user explicitly configured an
     // OpenAI-compatible endpoint. Prefer it over the Anthropic fallback
     // even when the model name has no recognized prefix — this is the
@@ -241,6 +274,9 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     }
     if openai_compat::has_api_key("XAI_API_KEY") {
         return ProviderKind::Xai;
+    }
+    if openai_compat::has_api_key("GOOGLE_API_KEY") {
+        return ProviderKind::GoogleAiStudio;
     }
     // Last resort: if OPENAI_BASE_URL is set without OPENAI_API_KEY (some
     // local providers like Ollama don't require auth), still route there.

@@ -110,15 +110,17 @@ jobs:
           $version = $tag.TrimStart('v')
           $dist = Join-Path $PWD "dist"
           $package = Join-Path $dist "installer-root"
+          $outputDir = Join-Path $PWD "..\installer"
           $iscc = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) "Inno Setup 6\ISCC.exe"
 
           Write-Host "Running ISCC with:"
           Write-Host "  AppVersion: $version"
           Write-Host "  SourceRoot: $package"
-          Write-Host "  OutputDir: $dist"
+          Write-Host "  OutputDir: $outputDir"
           Write-Host "  Script: dist\claw.iss"
           
-          & $iscc "/DAppVersion=$version" "/DSourceRoot=$package" "/DOutputDir=$dist" "dist\claw.iss"
+          New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+          & $iscc "/DAppVersion=$version" "/DSourceRoot=$package" "/DOutputDir=$outputDir" "dist\claw.iss"
 
       - name: Sign Windows installer
         if: env.WINDOWS_CODESIGN_PFX_BASE64 != ''
@@ -145,11 +147,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: claw-windows-installer
-          path: rust/dist/claw-*-windows-x64-installer.exe
+          path: installer/claw-*-windows-x64-installer.exe
 
       - name: Upload release assets
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: rust/dist/claw-*-windows-x64-installer.exe
+          files: installer/claw-*-windows-x64-installer.exe
           fail_on_unmatched_files: true
