@@ -8,7 +8,6 @@ use crate::error::ApiError;
 use crate::types::{MessageRequest, MessageResponse};
 
 pub mod anthropic;
-pub mod google_ai_studio;
 pub mod openai_compat;
 
 #[allow(dead_code)]
@@ -32,7 +31,6 @@ pub trait Provider {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     Anthropic,
-    GoogleAiStudio,
     Xai,
     OpenAi,
 }
@@ -124,6 +122,15 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
         },
     ),
+    (
+        "kimi",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "DASHSCOPE_API_KEY",
+            base_url_env: "DASHSCOPE_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
+        },
+    ),
 ];
 
 #[must_use]
@@ -146,8 +153,10 @@ pub fn resolve_model_alias(model: &str) -> String {
                     "grok-2" => "grok-2",
                     _ => trimmed,
                 },
-                ProviderKind::OpenAi => trimmed,
-                ProviderKind::GoogleAiStudio => trimmed,
+                ProviderKind::OpenAi => match *alias {
+                    "kimi" => "kimi-k2.5",
+                    _ => trimmed,
+                },
             })
         })
         .map_or_else(|| trimmed.to_string(), ToOwned::to_owned)
@@ -170,14 +179,6 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             auth_env: "XAI_API_KEY",
             base_url_env: "XAI_BASE_URL",
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
-        });
-    }
-    if canonical.starts_with("gemini-") || canonical.starts_with("google/") {
-        return Some(ProviderMetadata {
-            provider: ProviderKind::GoogleAiStudio,
-            auth_env: "GOOGLE_API_KEY",
-            base_url_env: "GOOGLE_BASE_URL",
-            default_base_url: google_ai_studio::DEFAULT_GOOGLE_BASE_URL,
         });
     }
     // Explicit provider-namespaced models (e.g. "openai/gpt-4.1-mini") must
@@ -205,6 +206,16 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
         });
     }
+    // Kimi models (kimi-k2.5, kimi-k1.5, etc.) via DashScope compatible-mode.
+    // Routes kimi/* and kimi-* model names to DashScope endpoint.
+    if canonical.starts_with("kimi/") || canonical.starts_with("kimi-") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "DASHSCOPE_API_KEY",
+            base_url_env: "DASHSCOPE_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
+        });
+    }
     None
 }
 
@@ -224,9 +235,6 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     }
     if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
         return ProviderKind::Anthropic;
-    }
-    if google_ai_studio::has_api_key("GOOGLE_API_KEY") {
-        return ProviderKind::GoogleAiStudio;
     }
     if openai_compat::has_api_key("OPENAI_API_KEY") {
         return ProviderKind::OpenAi;
@@ -281,21 +289,11 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 64_000,
             context_window_tokens: 131_072,
         }),
-        "openai/gpt-oss-120b" | "openai/gpt-oss-20b" => Some(ModelTokenLimit {
-            max_output_tokens: 4_096,
-            context_window_tokens: 131_072,
-        }),
-        "llama-3.3-70b-versatile" => Some(ModelTokenLimit {
-            max_output_tokens: 4_096,
-            context_window_tokens: 131_072,
-        }),
-        "groq/compound" => Some(ModelTokenLimit {
-            max_output_tokens: 8_192,
-            context_window_tokens: 131_072,
-        }),
-        "gemini-2.0-flash" | "gemini-2.0-flash-lite" => Some(ModelTokenLimit {
-            max_output_tokens: 8_192,
-            context_window_tokens: 1_048_576,
+        // Kimi models via DashScope (Moonshot AI)
+        // Source: https://platform.moonshot.cn/docs/intro
+        "kimi-k2.5" | "kimi-k1.5" => Some(ModelTokenLimit {
+            max_output_tokens: 16_384,
+            context_window_tokens: 256_000,
         }),
         _ => None,
     }
@@ -340,11 +338,6 @@ fn estimate_serialized_tokens<T: Serialize>(value: &T) -> u32 {
 /// credentials probably belong to a different provider and suggest the
 /// model-prefix routing fix that would select it.
 const FOREIGN_PROVIDER_ENV_VARS: &[(&str, &str, &str)] = &[
-    (
-        "GOOGLE_API_KEY",
-        "Google AI Studio",
-        "use a Gemini model name (for example `--model gemini-2.0-flash`) so provider routing selects the native Google backend, and set `GOOGLE_BASE_URL` only if you need a non-default Gemini API endpoint",
-    ),
     (
         "OPENAI_API_KEY",
         "OpenAI-compat",
@@ -590,6 +583,34 @@ mod tests {
     }
 
     #[test]
+    fn kimi_prefix_routes_to_dashscope() {
+        // Kimi models via DashScope (kimi-k2.5, kimi-k1.5, etc.)
+        let meta = super::metadata_for_model("kimi-k2.5")
+            .expect("kimi-k2.5 must resolve to DashScope metadata");
+        assert_eq!(meta.auth_env, "DASHSCOPE_API_KEY");
+        assert_eq!(meta.base_url_env, "DASHSCOPE_BASE_URL");
+        assert!(meta.default_base_url.contains("dashscope.aliyuncs.com"));
+        assert_eq!(meta.provider, ProviderKind::OpenAi);
+
+        // With provider prefix
+        let meta2 = super::metadata_for_model("kimi/kimi-k2.5")
+            .expect("kimi/kimi-k2.5 must resolve to DashScope metadata");
+        assert_eq!(meta2.auth_env, "DASHSCOPE_API_KEY");
+        assert_eq!(meta2.provider, ProviderKind::OpenAi);
+
+        // Different kimi variants
+        let meta3 = super::metadata_for_model("kimi-k1.5")
+            .expect("kimi-k1.5 must resolve to DashScope metadata");
+        assert_eq!(meta3.auth_env, "DASHSCOPE_API_KEY");
+    }
+
+    #[test]
+    fn kimi_alias_resolves_to_kimi_k2_5() {
+        assert_eq!(super::resolve_model_alias("kimi"), "kimi-k2.5");
+        assert_eq!(super::resolve_model_alias("KIMI"), "kimi-k2.5"); // case insensitive
+    }
+
+    #[test]
     fn keeps_existing_max_token_heuristic() {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
@@ -727,6 +748,69 @@ mod tests {
 
         preflight_message_request(&request)
             .expect("models without context metadata should skip the guarded preflight");
+    }
+
+    #[test]
+    fn returns_context_window_metadata_for_kimi_models() {
+        // kimi-k2.5
+        let k25_limit = model_token_limit("kimi-k2.5")
+            .expect("kimi-k2.5 should have token limit metadata");
+        assert_eq!(k25_limit.max_output_tokens, 16_384);
+        assert_eq!(k25_limit.context_window_tokens, 256_000);
+
+        // kimi-k1.5
+        let k15_limit = model_token_limit("kimi-k1.5")
+            .expect("kimi-k1.5 should have token limit metadata");
+        assert_eq!(k15_limit.max_output_tokens, 16_384);
+        assert_eq!(k15_limit.context_window_tokens, 256_000);
+    }
+
+    #[test]
+    fn kimi_alias_resolves_to_kimi_k25_token_limits() {
+        // The "kimi" alias resolves to "kimi-k2.5" via resolve_model_alias()
+        let alias_limit = model_token_limit("kimi")
+            .expect("kimi alias should resolve to kimi-k2.5 limits");
+        let direct_limit = model_token_limit("kimi-k2.5")
+            .expect("kimi-k2.5 should have limits");
+        assert_eq!(alias_limit.max_output_tokens, direct_limit.max_output_tokens);
+        assert_eq!(
+            alias_limit.context_window_tokens,
+            direct_limit.context_window_tokens
+        );
+    }
+
+    #[test]
+    fn preflight_blocks_oversized_requests_for_kimi_models() {
+        let request = MessageRequest {
+            model: "kimi-k2.5".to_string(),
+            max_tokens: 16_384,
+            messages: vec![InputMessage {
+                role: "user".to_string(),
+                content: vec![InputContentBlock::Text {
+                    text: "x".repeat(1_000_000), // Large input to exceed context window
+                }],
+            }],
+            system: Some("Keep the answer short.".to_string()),
+            tools: None,
+            tool_choice: None,
+            stream: true,
+            ..Default::default()
+        };
+
+        let error = preflight_message_request(&request)
+            .expect_err("oversized request should be rejected for kimi models");
+
+        match error {
+            ApiError::ContextWindowExceeded {
+                model,
+                context_window_tokens,
+                ..
+            } => {
+                assert_eq!(model, "kimi-k2.5");
+                assert_eq!(context_window_tokens, 256_000);
+            }
+            other => panic!("expected context-window preflight failure, got {other:?}"),
+        }
     }
 
     #[test]
