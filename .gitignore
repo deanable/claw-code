@@ -9,5 +9,6 @@ release/
 # Claw Code local artifacts
 .claw/settings.local.json
 .claw/sessions/
+.claw/llama.cpp/
 .clawhip/
 status-help.txt

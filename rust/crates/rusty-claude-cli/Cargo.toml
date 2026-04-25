@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "claw-launcher"
 path = "src/bin/claw-launcher.rs"
 
+[[bin]]
+name = "claw-llama-service"
+path = "src/bin/claw-llama-service.rs"
+
 [dependencies]
 api = { path = "../api" }
 commands = { path = "../commands" }
@@ -33,6 +37,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "signal", "time"] }
 tools = { path = "../tools" }
 webbrowser = "1.0"
 winreg = "0.55"
+windows-service = "0.7"
 
 [lints]
 workspace = true

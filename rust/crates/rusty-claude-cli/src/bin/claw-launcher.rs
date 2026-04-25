@@ -1,11 +1,27 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+#![allow(
+    clippy::assigning_clones,
+    clippy::cast_precision_loss,
+    clippy::format_push_string,
+    clippy::ignored_unit_patterns,
+    clippy::if_same_then_else,
+    clippy::map_unwrap_or,
+    clippy::match_same_arms,
+    clippy::struct_excessive_bools,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
+    clippy::unit_arg,
+    clippy::unused_self
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::process::Stdio;
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -28,6 +44,12 @@ const NEW_PROVIDER_KEY: &str = "__new_provider__";
 const LAUNCH_PROFILE_FILE_NAME: &str = ".claw-launch.json";
 const LAUNCHER_LOG_FILE_NAME: &str = "claw-launcher.log";
 const SANDBOX_SETTINGS_LOCAL_FILE_NAME: &str = "settings.local.json";
+const LLAMA_CPP_BIN_DIR_NAME: &str = "llama-b8857-bin-win-cpu-x64";
+const LLAMA_CPP_MODEL_PREFIX: &str = "llama.cpp/";
+const LLAMA_CPP_SERVICE_NAME: &str = "ClawLlamaCpp";
+const LLAMA_CPP_SERVICE_WRAPPER_EXE: &str = "claw-llama-service.exe";
+const LLAMA_CPP_SERVICE_WRAPPER_EXE_FALLBACK: &str = "claw-llama-service2.exe";
+const LLAMA_CPP_SERVICE_CONFIG_FILENAME: &str = "claw-llama-service.json";
 
 fn default_sandbox_enabled() -> bool {
     true
@@ -40,16 +62,18 @@ enum ProviderKind {
     OpenRouter,
     GoogleAiStudio,
     Ollama,
+    LlamaCpp,
     Custom,
 }
 
 impl ProviderKind {
-    fn all() -> [Self; 5] {
+    fn all() -> [Self; 6] {
         [
             Self::Groq,
             Self::OpenRouter,
             Self::GoogleAiStudio,
             Self::Ollama,
+            Self::LlamaCpp,
             Self::Custom,
         ]
     }
@@ -60,24 +84,26 @@ impl ProviderKind {
             Self::OpenRouter => "OpenRouter",
             Self::GoogleAiStudio => "Google AI Studio",
             Self::Ollama => "Ollama (Local)",
+            Self::LlamaCpp => "llama.cpp (Local)",
             Self::Custom => "Custom",
         }
     }
 
     fn supports_remote_models(self) -> bool {
-        true
+        !matches!(self, Self::LlamaCpp)
     }
 
     fn requires_api_key(self) -> bool {
-        !matches!(self, Self::Ollama)
+        !matches!(self, Self::Ollama | Self::LlamaCpp)
     }
 
-fn api_key_url(self) -> &'static str {
+    fn api_key_url(self) -> &'static str {
         match self {
             Self::Groq => "https://console.groq.com/keys",
             Self::OpenRouter => "https://openrouter.ai/keys",
             Self::GoogleAiStudio => "https://aistudio.google.com/app/apikey",
             Self::Ollama => "https://ollama.com/download",
+            Self::LlamaCpp => "https://github.com/ggerganov/llama.cpp",
             Self::Custom => "https://platform.openai.com/api-keys",
         }
     }
@@ -89,6 +115,10 @@ struct ProviderProfile {
     friendly_name: String,
     provider_kind: ProviderKind,
     api_key: String,
+    #[serde(default)]
+    huggingface_token: String,
+    #[serde(default)]
+    llama_cpp_server_path: PathBuf,
     base_url: String,
     workspace: PathBuf,
     model: String,
@@ -112,6 +142,8 @@ impl ProviderProfile {
             friendly_name: preset.name.to_string(),
             provider_kind: preset.kind,
             api_key: String::new(),
+            huggingface_token: String::new(),
+            llama_cpp_server_path: PathBuf::new(),
             base_url: preset.base_url.to_string(),
             workspace: default_workspace(),
             model: preset.model.to_string(),
@@ -207,6 +239,19 @@ struct OpenAiCompatModel {
 }
 
 #[derive(Debug, Deserialize)]
+struct HuggingFaceModelSearchResult {
+    id: String,
+    #[serde(default)]
+    siblings: Vec<HuggingFaceSibling>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HuggingFaceSibling {
+    #[serde(alias = "rfilename", alias = "filename")]
+    filename: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct OllamaTagsList {
     models: Vec<OllamaTagModel>,
 }
@@ -270,6 +315,12 @@ struct LauncherApp {
     selected_tools: BTreeSet<String>,
     models: Vec<ModelView>,
     model_search_filter: String,
+    llama_cpp_service_running: Option<bool>,
+    cached_git_branch: Option<String>,
+    cached_git_branch_workspace: PathBuf,
+    service_task: Option<mpsc::Receiver<Result<(bool, String), String>>>,
+    download_task: Option<mpsc::Receiver<Result<String, String>>>,
+    admin_status: Option<bool>,
     status: String,
 }
 
@@ -328,6 +379,12 @@ impl LauncherApp {
             selected_tools: BTreeSet::new(),
             models: Vec::new(),
             model_search_filter: String::new(),
+            llama_cpp_service_running: None,
+            cached_git_branch: None,
+            cached_git_branch_workspace: PathBuf::new(),
+            service_task: None,
+            download_task: None,
+            admin_status: None,
             status,
         };
         app.load_selected_provider();
@@ -366,6 +423,7 @@ impl LauncherApp {
         self.args_text = profile.args.join("\n");
         self.model_search_filter.clear();
         self.draft = profile;
+        self.refresh_cached_git_branch();
     }
 
     fn sync_editor_profile(&mut self) {
@@ -410,6 +468,8 @@ impl LauncherApp {
         self.draft.model = preset.model.to_string();
         if kind_changed {
             self.draft.api_key.clear();
+            self.llama_cpp_service_running = None;
+            self.cached_git_branch_workspace = PathBuf::new();
         }
         if self.selected_provider == NEW_PROVIDER_KEY
             || self.draft.friendly_name.trim().is_empty()
@@ -420,6 +480,26 @@ impl LauncherApp {
             self.draft.friendly_name = preset.name.to_string();
         }
         self.refresh_models_with_status(true);
+    }
+
+    fn refresh_cached_git_branch(&mut self) {
+        if self.draft.workspace.as_os_str().is_empty() || !self.draft.workspace.is_dir() {
+            self.cached_git_branch = None;
+            self.cached_git_branch_workspace = PathBuf::new();
+            return;
+        }
+        if self.cached_git_branch_workspace == self.draft.workspace {
+            return;
+        }
+        self.cached_git_branch_workspace = self.draft.workspace.clone();
+        self.cached_git_branch = read_git_branch(&self.draft.workspace);
+        log_launcher_event(format!(
+            "git_branch workspace='{}' branch='{}'",
+            self.draft.workspace.display(),
+            self.cached_git_branch
+                .clone()
+                .unwrap_or_else(|| "(none)".to_string())
+        ));
     }
 
     fn open_api_key_site(&mut self) {
@@ -448,6 +528,8 @@ impl LauncherApp {
             self.draft.provider_kind,
             &self.draft.base_url,
             &self.draft.api_key,
+            &self.model_search_filter,
+            &self.draft.huggingface_token,
         );
         match refreshed {
             Ok(models) => {
@@ -464,7 +546,10 @@ impl LauncherApp {
             Err(error) => {
                 // For local providers, don't keep a stale bundled list (it looks like
                 // the refresh worked when it didn't).
-                if matches!(self.draft.provider_kind, ProviderKind::Ollama) {
+                if matches!(
+                    self.draft.provider_kind,
+                    ProviderKind::Ollama | ProviderKind::LlamaCpp
+                ) {
                     self.models.clear();
                 }
                 if set_status {
@@ -473,7 +558,10 @@ impl LauncherApp {
             }
         }
         if self.models.is_empty()
-            && matches!(self.draft.provider_kind, ProviderKind::Ollama)
+            && matches!(
+                self.draft.provider_kind,
+                ProviderKind::Ollama | ProviderKind::LlamaCpp
+            )
             && !self.draft.model.trim().is_empty()
         {
             // If the local endpoint can't be queried, keep the UI usable by
@@ -498,13 +586,19 @@ impl LauncherApp {
     fn apply_model_search(&mut self) {
         let matches = self.filtered_models().len();
         self.status = if self.model_search_filter.is_empty() {
-            if matches!(self.draft.provider_kind, ProviderKind::Ollama) {
+            if matches!(
+                self.draft.provider_kind,
+                ProviderKind::Ollama | ProviderKind::LlamaCpp
+            ) {
                 "Showing all fetched models for this provider.".to_string()
             } else {
                 "Showing all known models for this provider.".to_string()
             }
         } else if matches == 0 {
-            if matches!(self.draft.provider_kind, ProviderKind::Ollama) {
+            if matches!(
+                self.draft.provider_kind,
+                ProviderKind::Ollama | ProviderKind::LlamaCpp
+            ) {
                 format!(
                     "No fetched models matched '{}'. You can still launch with the typed model id.",
                     self.model_search_filter
@@ -516,7 +610,10 @@ impl LauncherApp {
                 )
             }
         } else {
-            if matches!(self.draft.provider_kind, ProviderKind::Ollama) {
+            if matches!(
+                self.draft.provider_kind,
+                ProviderKind::Ollama | ProviderKind::LlamaCpp
+            ) {
                 format!(
                     "Filtered fetched models with '{}'. {} match{}.",
                     self.model_search_filter,
@@ -649,6 +746,12 @@ impl LauncherApp {
         let user_profile = std::env::var("USERPROFILE")
             .map_err(|_| "USERPROFILE is not set on this machine.".to_string())?;
 
+        let effective_model = if matches!(launch_profile.provider_kind, ProviderKind::LlamaCpp) {
+            prepare_llama_cpp_server(&launch_profile)?
+        } else {
+            launch_profile.model.clone()
+        };
+
         write_sandbox_settings_local(&launch_profile.workspace, launch_profile.sandbox_enabled)?;
 
         let effective_permission_mode = if launch_profile.dangerously_skip_permissions {
@@ -659,7 +762,7 @@ impl LauncherApp {
         let mut claw_command = format!(
             "& '{}' --model '{}' --permission-mode '{}'",
             powershell_escape(&self.claw_path.display().to_string()),
-            powershell_escape(&launch_profile.model),
+            powershell_escape(&effective_model),
             powershell_escape(effective_permission_mode)
         );
         if launch_profile.compact_output {
@@ -686,7 +789,7 @@ impl LauncherApp {
             launch_profile.workspace.display(),
             powershell_path.display(),
             self.claw_path.display(),
-            launch_profile.model
+            effective_model
         ));
 
         let mut command = Command::new(&powershell_path);
@@ -798,6 +901,51 @@ impl LauncherApp {
 
 impl eframe::App for LauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.admin_status.is_none() {
+            self.admin_status = Some(check_is_running_as_admin());
+            if launcher_debug_enabled() {
+                log_launcher_event(format!(
+                    "admin_status {}",
+                    self.admin_status.unwrap_or(false)
+                ));
+            }
+        }
+        if let Some(receiver) = self.service_task.as_ref() {
+            match receiver.try_recv() {
+                Ok(Ok((running, message))) => {
+                    self.status = message;
+                    self.llama_cpp_service_running = Some(running);
+                    self.service_task = None;
+                }
+                Ok(Err(error)) => {
+                    self.status = error;
+                    self.service_task = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.status = "Service operation did not report a result.".to_string();
+                    self.service_task = None;
+                }
+            }
+        }
+        if let Some(receiver) = self.download_task.as_ref() {
+            match receiver.try_recv() {
+                Ok(Ok(message)) => {
+                    self.status = message;
+                    self.download_task = None;
+                }
+                Ok(Err(error)) => {
+                    self.status = error;
+                    self.download_task = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.status = "Download did not report a result.".to_string();
+                    self.download_task = None;
+                }
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Claw Launcher");
             ui.label("Save reusable provider profiles, switch between them, and launch Claw with the matching workspace, model, and tools.");
@@ -882,6 +1030,9 @@ impl eframe::App for LauncherApp {
                             self.draft.base_url = preset.base_url.to_string();
                             self.draft.model = preset.model.to_string();
                         }
+                        self.llama_cpp_service_running = None;
+                        self.cached_git_branch_workspace = PathBuf::new();
+                        self.refresh_cached_git_branch();
                         self.refresh_models_with_status(true);
                     }
                 });
@@ -904,24 +1055,37 @@ impl eframe::App for LauncherApp {
                 });
 
                 ui.horizontal(|ui| {
-                    ui.label("API key");
-                    ui.add(
-                        TextEdit::singleline(&mut self.draft.api_key)
-                            .password(true)
-                            .desired_width(420.0),
-                    );
-                    let needs_api_key =
-                        self.draft.provider_kind.requires_api_key() && self.draft.api_key.trim().is_empty();
-                    let action_label = if needs_api_key {
-                        "Get API Key"
-                    } else {
-                        "Refresh Models"
-                    };
-                    if ui.button(action_label).clicked() {
-                        if needs_api_key {
-                            self.open_api_key_site();
-                        } else {
+                    if matches!(self.draft.provider_kind, ProviderKind::LlamaCpp) {
+                        ui.label("HF token");
+                        ui.add(
+                            TextEdit::singleline(&mut self.draft.huggingface_token)
+                                .password(true)
+                                .desired_width(420.0)
+                                .hint_text("Optional (for gated/private models)"),
+                        );
+                        if ui.button("Refresh Models").clicked() {
                             self.refresh_models_with_status(true);
+                        }
+                    } else {
+                        ui.label("API key");
+                        ui.add(
+                            TextEdit::singleline(&mut self.draft.api_key)
+                                .password(true)
+                                .desired_width(420.0),
+                        );
+                        let needs_api_key = self.draft.provider_kind.requires_api_key()
+                            && self.draft.api_key.trim().is_empty();
+                        let action_label = if needs_api_key {
+                            "Get API Key"
+                        } else {
+                            "Refresh Models"
+                        };
+                        if ui.button(action_label).clicked() {
+                            if needs_api_key {
+                                self.open_api_key_site();
+                            } else {
+                                self.refresh_models_with_status(true);
+                            }
                         }
                     }
                 });
@@ -930,6 +1094,198 @@ impl eframe::App for LauncherApp {
                     ui.label("Base URL");
                     ui.add(TextEdit::singleline(&mut self.draft.base_url).desired_width(420.0));
                 });
+
+                if matches!(self.draft.provider_kind, ProviderKind::LlamaCpp) {
+                    ui.horizontal(|ui| {
+                        ui.label("llama-server.exe");
+                        let mut display = if self.draft.llama_cpp_server_path.as_os_str().is_empty()
+                        {
+                            format!("(auto: .\\{LLAMA_CPP_BIN_DIR_NAME}\\llama-server.exe)")
+                        } else {
+                            self.draft.llama_cpp_server_path.display().to_string()
+                        };
+                        ui.add_enabled(
+                            false,
+                            TextEdit::singleline(&mut display).desired_width(420.0),
+                        );
+                        if ui.button("Browse").clicked() {
+                            if let Some(file) = rfd::FileDialog::new()
+                                .set_directory(&self.draft.workspace)
+                                .add_filter("Executable", &["exe"])
+                                .pick_file()
+                            {
+                                let lowered =
+                                    file.file_name().and_then(|name| name.to_str()).unwrap_or("");
+                                if lowered.eq_ignore_ascii_case("llama-server.exe") {
+                                    self.draft.llama_cpp_server_path = file.clone();
+                                    self.llama_cpp_service_running = None;
+                                    self.status = format!(
+                                        "Selected llama.cpp server: {}",
+                                        file.display()
+                                    );
+                                } else {
+                                    self.status = "Pick llama-server.exe (from your llama.cpp bin folder)."
+                                        .to_string();
+                                }
+                            }
+                        }
+                        if ui.button("Clear").clicked() {
+                            self.draft.llama_cpp_server_path = PathBuf::new();
+                            self.llama_cpp_service_running = None;
+                            self.status = format!(
+                                "Cleared llama-server.exe override (using .\\{LLAMA_CPP_BIN_DIR_NAME}\\llama-server.exe)."
+                            );
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Model");
+                        let cached = resolve_llama_cpp_cached_model(&self.draft).ok();
+                        let downloaded = cached.as_ref().is_some_and(|path| path.is_file());
+                        let status = if downloaded {
+                            "Downloaded"
+                        } else if cached.is_some() {
+                            "Not downloaded"
+                        } else {
+                            "Choose model"
+                        };
+                        ui.label(status);
+
+                        let can_download = cached.is_some() && self.download_task.is_none();
+                        if ui.add_enabled(can_download, egui::Button::new("Download model")).clicked()
+                        {
+                            self.status = "Downloading llama.cpp model...".to_string();
+                            let profile = self.draft.clone();
+                            let (tx, rx) = mpsc::channel();
+                            self.download_task = Some(rx);
+                            std::thread::spawn(move || {
+                                let result = (|| {
+                                    let (repo_id, filename) = parse_llama_cpp_spec(&profile.model)
+                                        .or_else(|| parse_bare_spec(&profile.model))
+                                        .ok_or_else(|| {
+                                            "Choose a llama.cpp model first (expected 'llama.cpp/<repo_id>::<filename.gguf>')."
+                                                .to_string()
+                                        })?;
+                                    let path = ensure_llama_cpp_model_downloaded(
+                                        &profile.workspace,
+                                        &repo_id,
+                                        &filename,
+                                        &profile.huggingface_token,
+                                    )?;
+                                    Ok::<_, String>(format!(
+                                        "Downloaded model to {}",
+                                        path.display()
+                                    ))
+                                })();
+                                let _ = tx.send(result);
+                            });
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Service");
+                        let is_admin = self.admin_status.unwrap_or(false);
+                        if !is_admin {
+                            ui.colored_label(
+                                Color32::from_rgb(215, 58, 73),
+                                "Admin required to install/uninstall",
+                            );
+                            if ui.button("Restart as Admin").clicked() {
+                                let exe = std::env::current_exe()
+                                    .ok()
+                                    .map(|path| path.display().to_string())
+                                    .unwrap_or_default();
+                                if exe.is_empty() {
+                                    self.status = "Could not resolve launcher exe path.".to_string();
+                                } else {
+                                    let mut command = Command::new(resolve_powershell_executable());
+                                    command.arg("-NoLogo").arg("-Command").arg(format!(
+                                        "Start-Process -FilePath '{}' -Verb RunAs",
+                                        exe.replace('\'', "''")
+                                    ));
+                                    if command.spawn().is_ok() {
+                                        self.status = "Requested elevation. Approve the UAC prompt to reopen the launcher as Administrator.".to_string();
+                                    } else {
+                                        self.status = "Failed to request elevation.".to_string();
+                                    }
+                                }
+                            }
+                            if ui.button("Recheck").clicked() {
+                                self.admin_status = Some(check_is_running_as_admin());
+                            }
+                        }
+                        let running = self.llama_cpp_service_running.unwrap_or_else(|| {
+                            if launcher_debug_enabled() {
+                                log_launcher_event(format!(
+                                    "service_cache_miss provider='{}' kind='{}'",
+                                    self.draft.friendly_name,
+                                    self.draft.provider_kind.label()
+                                ));
+                            }
+                            let running = llama_cpp_service_is_running();
+                            self.llama_cpp_service_running = Some(running);
+                            running
+                        });
+                        let status = if running { "Running" } else { "Not running" };
+                        ui.label(status);
+
+                        if running {
+                            if ui
+                                .add_enabled(
+                                    is_admin && self.service_task.is_none(),
+                                    egui::Button::new("Uninstall"),
+                                )
+                                .clicked()
+                            {
+                                self.status = "Uninstalling llama.cpp Windows service...".to_string();
+                                let (tx, rx) = mpsc::channel();
+                                self.service_task = Some(rx);
+                                std::thread::spawn(move || {
+                                    let result = uninstall_llama_cpp_service()
+                                        .map(|_| (false, "Uninstalled llama.cpp Windows service.".to_string()));
+                                    let _ = tx.send(result);
+                                });
+                            }
+                            if ui
+                                .add_enabled(
+                                    is_admin && self.service_task.is_none(),
+                                    egui::Button::new("Repair"),
+                                )
+                                .clicked()
+                            {
+                                self.status = "Repairing llama.cpp Windows service...".to_string();
+                                let exe_dir = self.exe_dir.clone();
+                                let profile = self.draft.clone();
+                                let (tx, rx) = mpsc::channel();
+                                self.service_task = Some(rx);
+                                std::thread::spawn(move || {
+                                    let result = repair_llama_cpp_service(&exe_dir, &profile)
+                                        .map(|_| (true, "Repaired llama.cpp Windows service.".to_string()));
+                                    let _ = tx.send(result);
+                                });
+                            }
+                        } else if ui
+                            .add_enabled(
+                                is_admin
+                                    && self.service_task.is_none()
+                                    && self.download_task.is_none(),
+                                egui::Button::new("Install"),
+                            )
+                            .clicked()
+                        {
+                            self.status = "Installing llama.cpp Windows service...".to_string();
+                            let exe_dir = self.exe_dir.clone();
+                            let profile = self.draft.clone();
+                            let (tx, rx) = mpsc::channel();
+                            self.service_task = Some(rx);
+                            std::thread::spawn(move || {
+                                let result = install_llama_cpp_service(&exe_dir, &profile)
+                                    .map(|_| (true, "Installed llama.cpp Windows service.".to_string()));
+                                let _ = tx.send(result);
+                            });
+                        }
+                    });
+                }
 
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.draft.respect_rate_limits, "Respect rate limits");
@@ -960,7 +1316,12 @@ impl eframe::App for LauncherApp {
                             {
                                 if let Some(root) = resolve_git_root(&folder) {
                                     self.draft.workspace = root.clone();
-                                    let branch = read_git_branch(&root).unwrap_or_else(|| "unknown".to_string());
+                                    self.cached_git_branch_workspace = PathBuf::new();
+                                    self.refresh_cached_git_branch();
+                                    let branch = self
+                                        .cached_git_branch
+                                        .clone()
+                                        .unwrap_or_else(|| "unknown".to_string());
                                     self.status = format!(
                                         "Selected git project: {} (branch {}).",
                                         root.display(),
@@ -968,6 +1329,8 @@ impl eframe::App for LauncherApp {
                                     );
                                 } else {
                                     self.draft.workspace = folder.clone();
+                                    self.cached_git_branch_workspace = PathBuf::new();
+                                    self.refresh_cached_git_branch();
                                     self.status = format!(
                                         "Selected folder (not a git repo): {}.",
                                         folder.display()
@@ -977,11 +1340,19 @@ impl eframe::App for LauncherApp {
                         }
                     });
 
-                    if let Some(branch) = read_git_branch(&self.draft.workspace) {
-                        ui.small(format!("Git branch: {branch}"));
-                    } else {
-                        ui.small("Git branch: (not a git repo)");
-                    }
+                    ui.horizontal(|ui| {
+                        let text = self
+                            .cached_git_branch
+                            .clone()
+                            .map(|branch| format!("Git branch: {branch}"))
+                            .unwrap_or_else(|| "Git branch: (not a git repo)".to_string());
+                        ui.small(text);
+                        if ui.button("Refresh branch").clicked() {
+                            self.cached_git_branch_workspace = PathBuf::new();
+                            self.refresh_cached_git_branch();
+                            self.status = "Refreshed git branch.".to_string();
+                        }
+                    });
 
                     ui.horizontal(|ui| {
                         ui.label("Permission");
@@ -1223,8 +1594,19 @@ fn default_workspace() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 fn resolve_git_root(path: &Path) -> Option<PathBuf> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(path)
         .output()
@@ -1242,7 +1624,7 @@ fn resolve_git_root(path: &Path) -> Option<PathBuf> {
 }
 
 fn read_git_branch(path: &Path) -> Option<String> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .current_dir(path)
         .output()
@@ -1259,7 +1641,7 @@ fn read_git_branch(path: &Path) -> Option<String> {
     }
 }
 
-fn provider_presets() -> [ProviderPreset; 5] {
+fn provider_presets() -> [ProviderPreset; 6] {
     [
         ProviderPreset {
             kind: ProviderKind::Groq,
@@ -1284,6 +1666,12 @@ fn provider_presets() -> [ProviderPreset; 5] {
             name: "Ollama (Local)",
             base_url: "http://localhost:11434/v1",
             model: "llama3",
+        },
+        ProviderPreset {
+            kind: ProviderKind::LlamaCpp,
+            name: "llama.cpp (Local)",
+            base_url: "http://127.0.0.1:8080/v1",
+            model: "",
         },
         ProviderPreset {
             kind: ProviderKind::Custom,
@@ -1336,6 +1724,8 @@ fn load_launcher_state(legacy_config_path: &Path) -> (LauncherState, String) {
             friendly_name: "Imported provider".to_string(),
             provider_kind: ProviderKind::Custom,
             api_key: legacy.openai_api_key,
+            huggingface_token: String::new(),
+            llama_cpp_server_path: PathBuf::new(),
             base_url: legacy.openai_base_url,
             workspace: legacy.workspace,
             model: legacy.model,
@@ -1488,6 +1878,14 @@ fn profile_from_sidecar(
             .clone()
             .or_else(|| fallback.as_ref().map(|profile| profile.api_key.clone()))
             .unwrap_or_default(),
+        huggingface_token: fallback
+            .as_ref()
+            .map(|profile| profile.huggingface_token.clone())
+            .unwrap_or_default(),
+        llama_cpp_server_path: fallback
+            .as_ref()
+            .map(|profile| profile.llama_cpp_server_path.clone())
+            .unwrap_or_default(),
         base_url: sidecar
             .base_url
             .clone()
@@ -1549,7 +1947,11 @@ fn profile_from_sidecar(
             .unwrap_or(false),
         dangerously_skip_permissions: sidecar
             .dangerously_skip_permissions
-            .or_else(|| fallback.as_ref().map(|profile| profile.dangerously_skip_permissions))
+            .or_else(|| {
+                fallback
+                    .as_ref()
+                    .map(|profile| profile.dangerously_skip_permissions)
+            })
             .unwrap_or(false),
     })
 }
@@ -1587,6 +1989,16 @@ fn merge_profile_with_registry_fallback(
             registry_profile.api_key
         } else {
             profile.api_key
+        },
+        huggingface_token: if profile.huggingface_token.trim().is_empty() {
+            registry_profile.huggingface_token
+        } else {
+            profile.huggingface_token
+        },
+        llama_cpp_server_path: if profile.llama_cpp_server_path.as_os_str().is_empty() {
+            registry_profile.llama_cpp_server_path
+        } else {
+            profile.llama_cpp_server_path
         },
         base_url: if profile.base_url.trim().is_empty() {
             registry_profile.base_url
@@ -1752,6 +2164,57 @@ fn log_launcher_event(message: impl AsRef<str>) {
     }
 }
 
+fn launcher_debug_enabled() -> bool {
+    std::env::var("CLAW_LAUNCHER_DEBUG")
+        .ok()
+        .map(|value| {
+            let lowered = value.trim().to_ascii_lowercase();
+            lowered == "1" || lowered == "true" || lowered == "yes" || lowered == "on"
+        })
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LlamaServiceConfig {
+    server_exe: PathBuf,
+    model_path: PathBuf,
+    host: String,
+    port: u16,
+}
+
+fn service_wrapper_exe_path(exe_dir: &Path) -> PathBuf {
+    exe_dir.join(LLAMA_CPP_SERVICE_WRAPPER_EXE)
+}
+
+fn resolve_service_wrapper_exe_path(exe_dir: &Path) -> PathBuf {
+    let primary = service_wrapper_exe_path(exe_dir);
+    if primary.is_file() {
+        return primary;
+    }
+    exe_dir.join(LLAMA_CPP_SERVICE_WRAPPER_EXE_FALLBACK)
+}
+
+fn service_wrapper_config_path(exe_dir: &Path) -> PathBuf {
+    exe_dir.join(LLAMA_CPP_SERVICE_CONFIG_FILENAME)
+}
+
+fn check_is_running_as_admin() -> bool {
+    let mut command = Command::new("net.exe");
+    command.arg("session");
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    command.status().is_ok_and(|status| status.success())
+}
+
 fn resolve_powershell_executable() -> PathBuf {
     if let Some(windir) = std::env::var_os("WINDIR") {
         let candidate = PathBuf::from(windir)
@@ -1809,8 +2272,13 @@ fn launch_env_vars(profile: &ProviderProfile) -> Vec<(&'static str, String)> {
             vars.push(("GROQ_API_KEY", profile.api_key.clone()));
             vars.push(("GROQ_BASE_URL", profile.base_url.clone()));
         }
-        ProviderKind::Ollama => {
+        ProviderKind::Ollama | ProviderKind::LlamaCpp => {
             vars.push(("OPENAI_BASE_URL", profile.base_url.clone()));
+            if matches!(profile.provider_kind, ProviderKind::LlamaCpp)
+                && !profile.huggingface_token.trim().is_empty()
+            {
+                vars.push(("HF_TOKEN", profile.huggingface_token.clone()));
+            }
         }
         _ => {
             vars.push(("OPENAI_API_KEY", profile.api_key.clone()));
@@ -1826,6 +2294,7 @@ fn provider_default_token_limit(provider_kind: ProviderKind) -> (u32, u32) {
         ProviderKind::OpenRouter => (131_072, 16_384),
         ProviderKind::GoogleAiStudio => (131_072, 16_384),
         ProviderKind::Ollama => (32_768, 4_096),
+        ProviderKind::LlamaCpp => (32_768, 4_096),
         ProviderKind::Custom => (131_072, 16_384),
     }
 }
@@ -1971,7 +2440,12 @@ fn refresh_models_from_endpoint(
     provider_kind: ProviderKind,
     base_url: &str,
     api_key: &str,
+    query: &str,
+    huggingface_token: &str,
 ) -> Result<Vec<ModelView>, String> {
+    if matches!(provider_kind, ProviderKind::LlamaCpp) {
+        return refresh_llama_cpp_models_from_huggingface(query, huggingface_token);
+    }
     let mut by_id = if matches!(provider_kind, ProviderKind::Ollama) {
         BTreeMap::new()
     } else {
@@ -2006,7 +2480,8 @@ fn refresh_models_from_endpoint(
             .entry(remote_model.id.clone())
             .or_insert_with(|| ModelView {
                 id: remote_model.id.clone(),
-                label: known_model_label(&remote_model.id).unwrap_or_else(|| remote_model.id.clone()),
+                label: known_model_label(&remote_model.id)
+                    .unwrap_or_else(|| remote_model.id.clone()),
                 context_window: known_model_context_window(&remote_model.id).unwrap_or(131_072),
                 max_output_tokens: known_model_max_output_tokens(&remote_model.id).unwrap_or(8_192),
                 tool_use_supported: true,
@@ -2095,6 +2570,725 @@ fn fetch_models(
         .map_err(|error| format!("failed to parse models response: {error}"))
 }
 
+fn huggingface_token() -> Option<String> {
+    for key in [
+        "HF_TOKEN",
+        "HUGGINGFACE_HUB_TOKEN",
+        "HUGGINGFACE_TOKEN",
+        "HUGGINGFACE_API_TOKEN",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn huggingface_token_override(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn huggingface_token_for_request(override_value: &str) -> Option<String> {
+    huggingface_token_override(override_value).or_else(huggingface_token)
+}
+
+fn refresh_llama_cpp_models_from_huggingface(
+    query: &str,
+    huggingface_token_override: &str,
+) -> Result<Vec<ModelView>, String> {
+    let query = query.trim();
+    let query = if query.is_empty() {
+        // Searching Hugging Face without a query is too broad. Default to a
+        // known GGUF publisher to keep "Refresh models" fast and relevant.
+        "LiquidAI gguf"
+    } else {
+        query
+    };
+
+    let client = Client::builder()
+        .build()
+        .map_err(|error| format!("http client build failed: {error}"))?;
+
+    let limit = "20".to_string();
+    let mut request = client.get("https://huggingface.co/api/models").query(&[
+        ("search", query),
+        ("limit", limit.as_str()),
+        ("full", "true"),
+        ("sort", "downloads"),
+        ("direction", "-1"),
+    ]);
+    if let Some(token) = huggingface_token_for_request(huggingface_token_override) {
+        request = request.bearer_auth(token);
+    }
+    let response = request
+        .send()
+        .map_err(|error| format!("failed to query Hugging Face models: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Hugging Face model search failed with {}",
+            response.status()
+        ));
+    }
+    let results = response
+        .json::<Vec<HuggingFaceModelSearchResult>>()
+        .map_err(|error| format!("failed to parse Hugging Face response: {error}"))?;
+
+    let (context_window, max_output_tokens) = provider_default_token_limit(ProviderKind::LlamaCpp);
+    let mut models = Vec::new();
+    for model in results {
+        for sibling in model.siblings {
+            if !sibling.filename.to_ascii_lowercase().ends_with(".gguf") {
+                continue;
+            }
+            let id = format!("llama.cpp/{}::{}", model.id, sibling.filename);
+            let label = format!("{} ({})", model.id, sibling.filename);
+            models.push(ModelView {
+                id,
+                label,
+                context_window,
+                max_output_tokens,
+                tool_use_supported: true,
+                from_api: true,
+            });
+            if models.len() >= 120 {
+                break;
+            }
+        }
+        if models.len() >= 120 {
+            break;
+        }
+    }
+
+    if models.is_empty() {
+        return Err(format!(
+            "No GGUF files found for '{query}'. Try a different search (example: 'qwen gguf')."
+        ));
+    }
+
+    models.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(models)
+}
+
+fn parse_llama_cpp_spec(model: &str) -> Option<(String, String)> {
+    let trimmed = model.trim();
+    let spec = trimmed.strip_prefix(LLAMA_CPP_MODEL_PREFIX)?;
+    let mut parts = spec.splitn(2, "::");
+    let repo_id = parts.next()?.trim();
+    let filename = parts.next()?.trim();
+    if repo_id.is_empty() || filename.is_empty() {
+        return None;
+    }
+    Some((repo_id.to_string(), filename.to_string()))
+}
+
+fn parse_bare_spec(model: &str) -> Option<(String, String)> {
+    let trimmed = model.trim();
+    let mut parts = trimmed.splitn(2, "::");
+    let repo_id = parts.next()?.trim();
+    let filename = parts.next()?.trim();
+    if repo_id.is_empty() || filename.is_empty() {
+        return None;
+    }
+    Some((repo_id.to_string(), filename.to_string()))
+}
+
+fn find_llama_cpp_bin_dir(start: &Path) -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("LLAMA_CPP_BIN_DIR") {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            let path = PathBuf::from(trimmed);
+            if path.is_dir() {
+                return Some(path);
+            }
+        }
+    }
+
+    let mut cursor = Some(start);
+    while let Some(dir) = cursor {
+        let candidate = dir.join(LLAMA_CPP_BIN_DIR_NAME);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        cursor = dir.parent();
+    }
+    None
+}
+
+fn base_url_models_endpoint(base_url: &str) -> String {
+    format!("{}/models", base_url.trim_end_matches('/'))
+}
+
+fn llama_cpp_is_ready(client: &Client, base_url: &str) -> bool {
+    let url = base_url_models_endpoint(base_url);
+    client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .is_ok_and(|resp| resp.status().is_success())
+}
+
+fn parse_host_port(base_url: &str) -> Result<(String, u16), String> {
+    let trimmed = base_url.trim();
+    let (scheme, rest) = trimmed.split_once("://").ok_or_else(|| {
+        "llama.cpp base URL must include a scheme (example: http://127.0.0.1:8080/v1)".to_string()
+    })?;
+    let authority = rest.split('/').next().unwrap_or("").trim();
+    if authority.is_empty() {
+        return Err("llama.cpp base URL is missing a host".to_string());
+    }
+
+    let default_port = if scheme.eq_ignore_ascii_case("https") {
+        443u16
+    } else {
+        80u16
+    };
+
+    let mut parts = authority.rsplitn(2, ':');
+    let last = parts.next().unwrap_or("");
+    let maybe_host = parts.next();
+    if let Some(host) = maybe_host {
+        let port = last
+            .parse::<u16>()
+            .map_err(|_| format!("invalid port in llama.cpp base URL: '{last}'"))?;
+        Ok((host.to_string(), port))
+    } else {
+        Ok((last.to_string(), default_port))
+    }
+}
+
+fn resolve_llama_cpp_server_exe(profile: &ProviderProfile) -> Result<PathBuf, String> {
+    if profile.llama_cpp_server_path.is_file() {
+        return Ok(profile.llama_cpp_server_path.clone());
+    }
+
+    let bin_dir = find_llama_cpp_bin_dir(&profile.workspace).ok_or_else(|| {
+        format!(
+            "could not find {LLAMA_CPP_BIN_DIR_NAME}. Set LLAMA_CPP_BIN_DIR, browse for llama-server.exe, or place the directory in your project folder."
+        )
+    })?;
+    let server = bin_dir.join("llama-server.exe");
+    if !server.is_file() {
+        return Err(format!(
+            "llama.cpp server binary not found at {}. Browse for llama-server.exe or set LLAMA_CPP_BIN_DIR.",
+            server.display()
+        ));
+    }
+    Ok(server)
+}
+
+fn ensure_llama_cpp_model_downloaded(
+    repo_root: &Path,
+    repo_id: &str,
+    filename: &str,
+    huggingface_token_override: &str,
+) -> Result<PathBuf, String> {
+    let safe_repo = repo_id.replace('/', "__");
+    let dest_dir = repo_root
+        .join(".claw")
+        .join("llama.cpp")
+        .join("models")
+        .join(safe_repo);
+    fs::create_dir_all(&dest_dir)
+        .map_err(|error| format!("failed to create llama.cpp model cache dir: {error}"))?;
+    let dest_path = dest_dir.join(filename);
+    if dest_path.is_file() {
+        return Ok(dest_path);
+    }
+
+    let url = format!("https://huggingface.co/{repo_id}/resolve/main/{filename}?download=true");
+    let client = Client::builder()
+        .build()
+        .map_err(|error| format!("http client build failed: {error}"))?;
+
+    let part_path = dest_path.with_extension("gguf.part");
+    let token = huggingface_token_for_request(huggingface_token_override);
+
+    for attempt in 1..=3 {
+        if launcher_debug_enabled() {
+            log_launcher_event(format!(
+                "hf_download attempt={} url='{}' dest='{}'",
+                attempt,
+                url,
+                dest_path.display()
+            ));
+        }
+
+        let mut request = client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(600));
+        if let Some(token) = token.clone() {
+            request = request.bearer_auth(token);
+        }
+
+        let response = request.send();
+        let mut response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                let message = format!("failed to download GGUF from Hugging Face: {error}");
+                if attempt == 3 {
+                    return Err(message);
+                }
+                std::thread::sleep(std::time::Duration::from_secs(attempt * 2));
+                continue;
+            }
+        };
+
+        if !response.status().is_success() {
+            return Err(format!(
+                "download failed: GET {url} -> {} (if this is a gated model, enter an HF token)",
+                response.status()
+            ));
+        }
+
+        let mut output = match fs::File::create(&part_path) {
+            Ok(file) => file,
+            Err(error) => return Err(format!("failed to write model: {error}")),
+        };
+
+        let mut written: u64 = 0;
+        let mut buffer = vec![0u8; 64 * 1024];
+        let mut download_error: Option<String> = None;
+        loop {
+            let read = match response.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(error) => {
+                    download_error = Some(format!(
+                        "failed to write GGUF to disk after {written} bytes: {error}"
+                    ));
+                    break;
+                }
+            };
+            if let Err(error) = output.write_all(&buffer[..read]) {
+                download_error = Some(format!(
+                    "failed to write GGUF to disk after {written} bytes: {error}"
+                ));
+                break;
+            }
+            written += read as u64;
+        }
+
+        if let Some(message) = download_error {
+            let _ = fs::remove_file(&part_path);
+            if launcher_debug_enabled() {
+                log_launcher_event(format!(
+                    "hf_download_error attempt={} written={} error='{}'",
+                    attempt, written, message
+                ));
+            }
+            if attempt == 3 {
+                return Err(message);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(attempt * 2));
+            continue;
+        }
+
+        output
+            .flush()
+            .map_err(|error| format!("failed to flush GGUF to disk: {error}"))?;
+        fs::rename(&part_path, &dest_path)
+            .map_err(|error| format!("failed to finalize GGUF download: {error}"))?;
+        return Ok(dest_path);
+    }
+
+    Ok(dest_path)
+}
+
+fn llama_cpp_cached_model_path(repo_root: &Path, repo_id: &str, filename: &str) -> PathBuf {
+    let safe_repo = repo_id.replace('/', "__");
+    repo_root
+        .join(".claw")
+        .join("llama.cpp")
+        .join("models")
+        .join(safe_repo)
+        .join(filename)
+}
+
+fn resolve_llama_cpp_cached_model(profile: &ProviderProfile) -> Result<PathBuf, String> {
+    let (repo_id, filename) = parse_llama_cpp_spec(&profile.model)
+        .or_else(|| parse_bare_spec(&profile.model))
+        .ok_or_else(|| {
+            "Choose a llama.cpp model first (expected 'llama.cpp/<repo_id>::<filename.gguf>')."
+                .to_string()
+        })?;
+    if !filename.to_ascii_lowercase().ends_with(".gguf") {
+        return Err(format!(
+            "llama.cpp model spec must reference a .gguf file (got '{filename}')."
+        ));
+    }
+    Ok(llama_cpp_cached_model_path(
+        &profile.workspace,
+        &repo_id,
+        &filename,
+    ))
+}
+
+fn start_llama_cpp_server(
+    base_url: &str,
+    server_exe: &Path,
+    model_path: &Path,
+) -> Result<(), String> {
+    let client = Client::builder()
+        .build()
+        .map_err(|error| format!("http client build failed: {error}"))?;
+    if llama_cpp_is_ready(&client, base_url) {
+        return Ok(());
+    }
+
+    if !server_exe.is_file() {
+        return Err(format!(
+            "llama.cpp server binary not found at {}. Browse for llama-server.exe or set LLAMA_CPP_BIN_DIR.",
+            server_exe.display()
+        ));
+    }
+
+    let (host, port) = parse_host_port(base_url)?;
+
+    let bin_dir = server_exe
+        .parent()
+        .ok_or_else(|| format!("invalid llama-server.exe path: {}", server_exe.display()))?;
+
+    let mut command = Command::new(server_exe);
+    command.current_dir(bin_dir);
+    command.arg("-m").arg(model_path);
+    command.arg("--host").arg(host);
+    command.arg("--port").arg(port.to_string());
+
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let existing_path = std::env::var_os("PATH").unwrap_or_default();
+    command.env(
+        "PATH",
+        format!("{};{}", bin_dir.display(), existing_path.to_string_lossy()),
+    );
+    command.spawn().map_err(|error| {
+        format!(
+            "failed to start llama.cpp server at {}: {error}",
+            server_exe.display()
+        )
+    })?;
+
+    let url = base_url_models_endpoint(base_url);
+    for _ in 0..40 {
+        if llama_cpp_is_ready(&client, base_url) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    Err(format!(
+        "llama.cpp server did not become ready at {url} after waiting."
+    ))
+}
+
+fn resolve_llama_cpp_model_id(base_url: &str) -> Result<String, String> {
+    let client = Client::builder()
+        .build()
+        .map_err(|error| format!("http client build failed: {error}"))?;
+    let url = base_url_models_endpoint(base_url);
+    let response = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .map_err(|error| format!("failed to query llama.cpp /models endpoint: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("GET {url} -> {}", response.status()));
+    }
+    let payload = response
+        .json::<OpenAiCompatModelList>()
+        .map_err(|error| format!("failed to parse /models response: {error}"))?;
+    payload
+        .data
+        .into_iter()
+        .next()
+        .map(|model| model.id)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| "llama.cpp /models returned no model ids".to_string())
+}
+
+fn sc_output_to_string(output: &std::process::Output) -> String {
+    let mut parts = Vec::new();
+    if !output.stdout.is_empty() {
+        parts.push(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    }
+    if !output.stderr.is_empty() {
+        parts.push(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    parts
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn sc_failed_code(output_text: &str) -> Option<u32> {
+    let failed = output_text.find("FAILED ")?;
+    let after = &output_text[(failed + "FAILED ".len())..];
+    let mut digits = String::new();
+    for ch in after.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else {
+            break;
+        }
+    }
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse::<u32>().ok()
+    }
+}
+
+fn run_sc(args: &[String]) -> Result<std::process::Output, String> {
+    let mut command = Command::new("sc.exe");
+    command.args(args);
+
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    if launcher_debug_enabled() {
+        log_launcher_event(format!("sc.exe args={:?}", args));
+    }
+
+    command
+        .output()
+        .map_err(|error| format!("failed to run sc.exe: {error}"))
+}
+
+fn llama_cpp_service_exists() -> bool {
+    let args = ["query".to_string(), LLAMA_CPP_SERVICE_NAME.to_string()];
+    run_sc(&args).is_ok_and(|output| output.status.success())
+}
+
+fn llama_cpp_service_is_running() -> bool {
+    let args = ["query".to_string(), LLAMA_CPP_SERVICE_NAME.to_string()];
+    let Ok(output) = run_sc(&args) else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let combined = sc_output_to_string(&output);
+    let running = combined.to_ascii_uppercase().contains("RUNNING");
+    if launcher_debug_enabled() {
+        log_launcher_event(format!(
+            "service_query name='{}' running={}",
+            LLAMA_CPP_SERVICE_NAME, running
+        ));
+    }
+    running
+}
+
+fn uninstall_llama_cpp_service_with_wait() -> Result<(), String> {
+    if !llama_cpp_service_exists() {
+        return Ok(());
+    }
+
+    let stop_args = ["stop".to_string(), LLAMA_CPP_SERVICE_NAME.to_string()];
+    let _ = run_sc(&stop_args);
+
+    let delete_args = ["delete".to_string(), LLAMA_CPP_SERVICE_NAME.to_string()];
+    let deleted = run_sc(&delete_args)?;
+    if !deleted.status.success() {
+        let output = sc_output_to_string(&deleted);
+        return Err(format!(
+            "failed to uninstall service (try running the launcher as Administrator): {}",
+            output
+        ));
+    }
+
+    // SCM can keep the service "marked for deletion" until all handles close.
+    // Wait a bit so recreate works in one click.
+    for _ in 0..40 {
+        if !llama_cpp_service_exists() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    Ok(())
+}
+
+fn install_llama_cpp_service(exe_dir: &Path, profile: &ProviderProfile) -> Result<(), String> {
+    let base_url = profile.base_url.trim();
+    if base_url.is_empty() {
+        return Err("llama.cpp base URL is empty".to_string());
+    }
+
+    let wrapper_exe = resolve_service_wrapper_exe_path(exe_dir);
+    if !wrapper_exe.is_file() {
+        return Err(format!(
+            "Missing {} next to the launcher. Rebuild/reinstall the launcher bundle.",
+            wrapper_exe.display()
+        ));
+    }
+
+    let server_exe = resolve_llama_cpp_server_exe(profile)?;
+    let model_path = resolve_llama_cpp_cached_model(profile)?;
+    if !model_path.is_file() {
+        return Err(format!(
+            "Model is not downloaded yet (expected {}). Click 'Download model' first.",
+            model_path.display()
+        ));
+    }
+
+    let (host, port) = parse_host_port(base_url)?;
+
+    let config = LlamaServiceConfig {
+        server_exe: server_exe.clone(),
+        model_path: model_path.clone(),
+        host,
+        port,
+    };
+    let config_path = service_wrapper_config_path(exe_dir);
+    let body = serde_json::to_vec_pretty(&config)
+        .map_err(|error| format!("failed to serialize service config: {error}"))?;
+    fs::write(&config_path, body)
+        .map_err(|error| format!("failed to write {}: {error}", config_path.display()))?;
+
+    let wrapper_binpath = format!("\"{}\"", wrapper_exe.display());
+
+    if launcher_debug_enabled() {
+        log_launcher_event(format!(
+            "service_install wrapper='{}' server='{}' model='{}' base_url='{}'",
+            wrapper_exe.display(),
+            server_exe.display(),
+            model_path.display(),
+            base_url
+        ));
+    }
+
+    if llama_cpp_service_exists() {
+        let _ = uninstall_llama_cpp_service_with_wait();
+        // Update the existing service to point at the wrapper (and new config).
+        let config_args = [
+            "config".to_string(),
+            LLAMA_CPP_SERVICE_NAME.to_string(),
+            "binPath=".to_string(),
+            wrapper_binpath.clone(),
+            "start=".to_string(),
+            "auto".to_string(),
+        ];
+        let configured = run_sc(&config_args)?;
+        if !configured.status.success() {
+            return Err(format!(
+                "failed to configure Windows service (try running the launcher as Administrator): {}",
+                sc_output_to_string(&configured)
+            ));
+        }
+    } else {
+        let create_args = [
+            "create".to_string(),
+            LLAMA_CPP_SERVICE_NAME.to_string(),
+            "binPath=".to_string(),
+            wrapper_binpath.clone(),
+            "start=".to_string(),
+            "auto".to_string(),
+            "DisplayName=".to_string(),
+            "Claw llama.cpp server".to_string(),
+        ];
+        let create = run_sc(&create_args)?;
+        if !create.status.success() {
+            let output = sc_output_to_string(&create);
+            if sc_failed_code(&output) == Some(1072) {
+                return Err(format!(
+                    "service is marked for deletion; wait a few seconds and try again. Details: {output}"
+                ));
+            }
+            return Err(format!(
+                "failed to create Windows service (try running the launcher as Administrator): {}",
+                output
+            ));
+        }
+    }
+
+    let start_args = ["start".to_string(), LLAMA_CPP_SERVICE_NAME.to_string()];
+    let start = run_sc(&start_args)?;
+    if !start.status.success() {
+        return Err(format!(
+            "service installed but failed to start: {}",
+            sc_output_to_string(&start)
+        ));
+    }
+
+    Ok(())
+}
+
+fn uninstall_llama_cpp_service() -> Result<(), String> {
+    if !llama_cpp_service_exists() {
+        return Ok(());
+    }
+    let stop_args = ["stop".to_string(), LLAMA_CPP_SERVICE_NAME.to_string()];
+    let _ = run_sc(&stop_args);
+    let delete_args = ["delete".to_string(), LLAMA_CPP_SERVICE_NAME.to_string()];
+    let deleted = run_sc(&delete_args)?;
+    if !deleted.status.success() {
+        return Err(format!(
+            "failed to uninstall service (try running the launcher as Administrator): {}",
+            sc_output_to_string(&deleted)
+        ));
+    }
+    Ok(())
+}
+
+fn repair_llama_cpp_service(exe_dir: &Path, profile: &ProviderProfile) -> Result<(), String> {
+    if launcher_debug_enabled() {
+        log_launcher_event("service_repair requested");
+    }
+    let _ = uninstall_llama_cpp_service_with_wait();
+    install_llama_cpp_service(exe_dir, profile)
+}
+
+fn prepare_llama_cpp_server(profile: &ProviderProfile) -> Result<String, String> {
+    let base_url = profile.base_url.trim();
+    if base_url.is_empty() {
+        return Err("llama.cpp base URL is empty".to_string());
+    }
+
+    let (repo_id, filename) = parse_llama_cpp_spec(&profile.model)
+        .or_else(|| parse_bare_spec(&profile.model))
+        .ok_or_else(|| {
+            "expected model spec 'llama.cpp/<repo_id>::<filename.gguf>' (or '<repo_id>::<filename.gguf>')"
+                .to_string()
+        })?;
+
+    if !filename.to_ascii_lowercase().ends_with(".gguf") {
+        return Err(format!(
+            "llama.cpp model spec must reference a .gguf file (got '{filename}')."
+        ));
+    }
+
+    let server_exe = resolve_llama_cpp_server_exe(profile)?;
+    let repo_root = profile.workspace.clone();
+
+    let model_path = ensure_llama_cpp_model_downloaded(
+        &repo_root,
+        &repo_id,
+        &filename,
+        &profile.huggingface_token,
+    )?;
+    start_llama_cpp_server(base_url, &server_exe, &model_path)?;
+
+    resolve_llama_cpp_model_id(base_url).or_else(|_| Ok("llama.cpp".to_string()))
+}
+
 fn model_matches_provider(model_id: &str, provider_kind: ProviderKind) -> bool {
     let lowered = model_id.to_ascii_lowercase();
     match provider_kind {
@@ -2115,6 +3309,7 @@ fn model_matches_provider(model_id: &str, provider_kind: ProviderKind) -> bool {
         ProviderKind::OpenRouter => lowered.contains('/'),
         ProviderKind::GoogleAiStudio => lowered.starts_with("gemini-"),
         ProviderKind::Ollama => true,
+        ProviderKind::LlamaCpp => true,
         ProviderKind::Custom => true,
     }
 }
